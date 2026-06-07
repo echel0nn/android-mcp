@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "android-mcp"
+version = "0.1.0"
+description = "Mobile security audit MCP server — wraps apktool, jadx, mobsf, androguard, frida-helpers, and adjacent Android security tooling under one MCP surface"
+requires-python = ">=3.12"
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+
+dependencies = [
+    "fastmcp>=2.0.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "anyio>=4.0.0",
+    "pydantic>=2.0.0",
+    # Mobile-security toolchain — installed as PEP517 deps where possible,
+    # shelled out to OS packages where not. See README "Installing the
+    # backend tools" for the OS-package shopping list (apktool, jadx CLI,
+    # frida, etc.).
+    "androguard>=4.0.0",          # APK static analysis (manifest, dex, signatures)
+    "yara-python>=4.5.0",         # malware-rule scanning over decompiled output
+    "lief>=0.16.0",                # ELF/Mach-O inside APKs (native .so files)
+    "cryptography>=42.0.0",       # certificate / signing analysis
+    "requests>=2.31.0",            # MobSF REST API client
+]
+
+[project.optional-dependencies]
+dynamic = [
+    # Optional — only needed if you want to drive Frida from inside this MCP
+    # instead of running it externally. Most operators keep frida out of the
+    # MCP and use the dedicated frida-server-on-device flow.
+    "frida>=16.0.0",
+    "frida-tools>=12.0.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5.0",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+android-mcp = "android_mcp.__main__:main"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
