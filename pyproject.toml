@@ -35,6 +35,14 @@ dynamic = [
     "frida>=16.0.0",
     "frida-tools>=12.0.0",
 ]
+scanners = [
+    # Optional pure-Python static scanners that this MCP shells out to.
+    # Operators install these into the same venv they run android-mcp from
+    # so the CLIs land on PATH. CLIs that are not pip-installable (apktool,
+    # jadx, adb, drozer-agent, AndroBugs, MobSF) stay in the OS-prereq
+    # README table — they cannot be expressed here.
+    "qark>=4.0.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
