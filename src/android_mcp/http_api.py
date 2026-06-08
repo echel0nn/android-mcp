@@ -16,17 +16,31 @@ Routes:
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 
+from .async_runtime import configure_thread_pool, run_tool, runtime_stats
 from .server import mcp
 
 _log = logging.getLogger(__name__)
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Resize the anyio worker-thread pool inside the running loop —
+    # anyio's default limiter is a per-loop singleton, so it can only
+    # be touched once the loop is up. Single-worker uvicorn calls
+    # build_app() BEFORE booting the loop; lifespan startup runs
+    # AFTER the loop starts.
+    applied_limit = configure_thread_pool()
+    _log.info("async runtime: thread pool limit set to %d", applied_limit)
+    yield
+
+
 def build_app() -> FastAPI:
-    app = FastAPI(title="android-mcp", version="0.1.0")
+    app = FastAPI(title="android-mcp", version="0.1.0", lifespan=_lifespan)
 
     # Build a one-shot tool catalogue. FastMCP exposes the registered
     # tools via the underlying mcp.tools dict; per-version safety means
@@ -64,59 +78,92 @@ def build_app() -> FastAPI:
             raise HTTPException(404, detail=f"unknown tool: {name}")
         try:
             payload = await request.json()
-        except Exception:
+        except (ValueError, TypeError):
             payload = {}
         if not isinstance(payload, dict):
             raise HTTPException(400, detail="body must be a JSON object of kwargs")
-        try:
-            result = await _invoke(tool, **payload)
-        except TypeError as exc:
-            raise HTTPException(400, detail=f"kwargs error: {exc}") from exc
-        except Exception as exc:
-            _log.exception("tool %s raised", name)
-            raise HTTPException(500, detail=f"{type(exc).__name__}: {exc}") from exc
-        return result
+        # Resolve the underlying callable once; run_tool handles
+        # sync/async detection + per-tool cap + dedup + timeout.
+        fn = getattr(tool, "fn", None) or getattr(tool, "func", None) or tool
+        return await run_tool(name, fn, payload)
 
     @app.get("/runtime")
     async def runtime_diag() -> dict[str, Any]:
-        # Mirror audit-mcp's /runtime shape so a single ops dashboard
-        # can show per-tool concurrency state.
-        return {
-            "tool_count": len(tool_index),
-            "tools": sorted(tool_index.keys()),
-        }
+        stats = runtime_stats()
+        stats["tool_count"] = len(tool_index)
+        stats["tools"] = sorted(tool_index.keys())
+        return stats
 
     return app
 
 
+_TOOL_INDEX_CACHE: dict[str, Any] | None = None
+
+
 def _build_tool_index(mcp_instance) -> dict[str, Any]:
-    """Best-effort enumeration of registered tools across FastMCP versions."""
-    for attr in ("tools", "_tools", "tool_registry"):
-        candidate = getattr(mcp_instance, attr, None)
-        if isinstance(candidate, dict):
-            return dict(candidate)
-        if hasattr(candidate, "items") and callable(candidate.items):
-            return dict(candidate.items())
-    raise RuntimeError(
-        "could not enumerate FastMCP tools — server.py registered "
-        "nothing, or the FastMCP API shifted; inspect mcp.* attributes",
-    )
+    """Enumerate registered FastMCP tools as a ``{name: tool}`` dict.
+
+    FastMCP ≥ 3.x exposes the tool registry only via the async
+    :meth:`list_tools` method (the legacy ``tools`` / ``_tools`` /
+    ``tool_registry`` attribute paths older docs referenced no longer
+    exist on the public surface). We resolve the coroutine to a list
+    once and cache the result at module scope; the tool set is fixed
+    at import time when each ``register(mcp)`` runs, so subsequent
+    enumeration is a dict lookup.
+
+    Loop-aware: in single-worker uvicorn mode ``build_app`` runs
+    BEFORE the event loop starts, so ``asyncio.run`` works directly.
+    In multi-worker (``factory=True``) mode each worker calls
+    ``build_app`` from INSIDE its own loop — ``asyncio.run`` raises
+    ``RuntimeError: cannot be called from a running event loop``.
+    Fall through to a fresh thread that hosts its own loop.
+    """
+    global _TOOL_INDEX_CACHE
+    if _TOOL_INDEX_CACHE is not None:
+        return _TOOL_INDEX_CACHE
+
+    import asyncio
+    import concurrent.futures
+
+    try:
+        asyncio.get_running_loop()
+        in_loop = True
+    except RuntimeError:
+        in_loop = False
+
+    if in_loop:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            tools = pool.submit(
+                lambda: asyncio.run(mcp_instance.list_tools()),
+            ).result()
+    else:
+        tools = asyncio.run(mcp_instance.list_tools())
+
+    if not tools:
+        raise RuntimeError(
+            "FastMCP.list_tools() returned no tools — server.py registered "
+            "nothing. Inspect android_mcp.server._register_all().",
+        )
+    _TOOL_INDEX_CACHE = {t.name: t for t in tools}
+    return _TOOL_INDEX_CACHE
+
+
+def reset_tool_index_cache() -> None:
+    """Drop the cached tool index. Used by tests that re-build the app."""
+    global _TOOL_INDEX_CACHE
+    _TOOL_INDEX_CACHE = None
 
 
 def _tool_schema(tool: Any) -> dict[str, Any]:
-    if hasattr(tool, "schema") and callable(tool.schema):
-        return tool.schema()
+    # FastMCP attaches the tool's INPUT JSON schema as ``tool.parameters``
+    # (already a draft-2020-12 dict). Older docs suggested ``tool.schema()``,
+    # but on FastMCP 3.x that's Pydantic's deprecated class-level method —
+    # it returns the FunctionTool's own schema, not the tool's inputs.
     for attr in ("parameters", "input_schema", "json_schema"):
         v = getattr(tool, attr, None)
+        if isinstance(v, dict):
+            return v
         if v:
-            return v if isinstance(v, dict) else {"raw": str(v)}
+            return {"raw": str(v)}
     return {"description": "no schema available"}
 
-
-async def _invoke(tool: Any, **kwargs: Any) -> Any:
-    """Call a FastMCP tool, awaiting if it's async."""
-    fn = getattr(tool, "fn", None) or getattr(tool, "func", None) or tool
-    out = fn(**kwargs)
-    if hasattr(out, "__await__"):
-        out = await out
-    return out
