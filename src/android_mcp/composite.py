@@ -16,10 +16,18 @@ Implemented so far:
                           reflection, IPC, SMS, location, dynamic-code-
                           loading, native-exec, webview, …). Drops the
                           report at ``<workdir>/<sha[:16]>/behavior.json``.
+    verify_capabilities — projects an APK onto a curated mobile-
+                          capabilities catalogue (permissions, intent
+                          actions, exported components, manifest flags,
+                          signing schemes) and returns a typed
+                          ``MobileCapabilityProfile`` with confirmed /
+                          absent / uncategorized buckets. Mirrors
+                          audit-mcp's ``verify_capabilities`` shape so
+                          the VR persona prompt template translates
+                          directly.
 
-Reserved per PRD §A-10 + §A-12 for follow-up iterations:
+Reserved per PRD §A-12 for follow-up iterations:
 
-    verify_capabilities
     compute_risk_score
 
 Each composite handler is registered via :func:`register` and follows
@@ -38,6 +46,8 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Iterator
+
+from pydantic import BaseModel, Field
 
 _log = logging.getLogger(__name__)
 
@@ -308,6 +318,404 @@ _DEFAULT_BEHAVIOR_WORKDIR = Path(
 ).expanduser()
 
 
+# ---------------------------------------------------------------------
+# verify_capabilities — typed return models
+# ---------------------------------------------------------------------
+#
+# Mirror audit-mcp's ``verify_capabilities`` envelope so the VR persona
+# prompt template translates directly. Each confirmed capability
+# carries an ``evidence`` list — the exact permissions, intent
+# actions, components, manifest flags, or signing schemes that
+# triggered the verdict — so the persona can cite specific
+# AndroidManifest.xml lines / data signals when proposing follow-up
+# audit questions.
+
+
+class CapabilityEvidence(BaseModel):
+    """One piece of evidence supporting a confirmed capability.
+
+    ``source`` is one of ``permission`` / ``intent_action`` /
+    ``intent_filter`` / ``exported_component`` / ``manifest_flag`` /
+    ``signing_scheme``. ``detail`` is the specific string: a
+    permission FQN, an intent action, an intent-filter pair like
+    ``VIEW+BROWSABLE@activity:com.foo.Bar``, a ``kind:name``
+    component pair, a ``component.attr=value`` manifest flag, or
+    an APK signing scheme label.
+    """
+
+    source: str
+    detail: str
+
+
+class ConfirmedCapability(BaseModel):
+    """A capability the APK demonstrably exercises.
+
+    ``evidence`` is the de-duplicated list of signals that confirm
+    the capability. Empty list means the capability fired on a
+    special-case rule (handled out-of-band) without contributing
+    catalogue evidence — currently unreachable, kept as a guard
+    so adding new specials never silently drops them.
+    """
+
+    name: str
+    description: str
+    evidence: list[CapabilityEvidence] = Field(default_factory=list)
+
+
+class AbsentCapability(BaseModel):
+    """A catalogue capability the APK does not exercise."""
+
+    name: str
+    description: str
+
+
+class UncategorizedItem(BaseModel):
+    """A permission or intent action the APK declares that the
+    catalogue does not yet know about — the catalogue's growth list.
+    """
+
+    kind: str
+    name: str
+
+
+class MobileCapabilityProfile(BaseModel):
+    """High-level capability snapshot for an APK.
+
+    Shape mirrors audit-mcp's ``verify_capabilities`` for Windows
+    binaries: ``confirmed`` (matched by at least one evidence
+    source), ``absent`` (the catalogue capability that this APK
+    does not exercise), and ``uncategorized`` (declared
+    permissions or intent actions that don't map to any catalogue
+    capability).
+    """
+
+    package: str | None
+    apk_path: str
+    confirmed: list[ConfirmedCapability]
+    absent: list[AbsentCapability]
+    uncategorized: list[UncategorizedItem]
+
+
+# ---------------------------------------------------------------------
+# verify_capabilities — capabilities catalogue
+# ---------------------------------------------------------------------
+#
+# Each capability lists:
+#   description     — one-line statement of the capability
+#   permissions     — tuple of FQN Android permissions; ANY match
+#                     contributes evidence
+#   intent_actions  — tuple of intent-filter action strings; ANY
+#                     match across any component contributes
+#                     evidence
+#   manifest_flags  — tuple of ``(tag, attr, expected_value)``
+#                     triples against the decoded manifest.
+#                     ``expected_value`` of ``None`` means "any
+#                     non-empty value counts" — useful for resource
+#                     references like ``android:networkSecurityConfig``
+#                     where the presence of the attribute is the
+#                     signal, not the specific resource id.
+#
+# Three specials are handled out-of-band by the handler because they
+# don't fit the flat (permission, action, flag) model:
+#   exported_components            — any component reachable from
+#                                    other apps (from androguard's
+#                                    exported-component scan)
+#   deep_linking                   — VIEW + BROWSABLE intent filter
+#                                    pair on the same component
+#   modern_signing_scheme /        — derived from the v1/v2/v3/v3.1
+#     legacy_signing_scheme_only     signature schemes present on
+#                                    the APK
+#
+# Adding a new permission-driven capability is a single dict entry
+# here; no handler change required. Adding a new manifest-flag
+# capability is one entry with the ``manifest_flags`` tuple
+# populated; still no handler change.
+_MOBILE_CAPABILITIES: dict[str, dict[str, Any]] = {
+    "internet_access": {
+        "description": "Sends or receives data over the internet.",
+        "permissions": (
+            "android.permission.INTERNET",
+            "android.permission.ACCESS_NETWORK_STATE",
+            "android.permission.ACCESS_WIFI_STATE",
+            "android.permission.CHANGE_NETWORK_STATE",
+            "android.permission.CHANGE_WIFI_STATE",
+        ),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+    "location_access": {
+        "description": "Reads device location (foreground or background).",
+        "permissions": (
+            "android.permission.ACCESS_FINE_LOCATION",
+            "android.permission.ACCESS_COARSE_LOCATION",
+            "android.permission.ACCESS_BACKGROUND_LOCATION",
+        ),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+    "camera_access": {
+        "description": "Captures images or video from the camera.",
+        "permissions": (
+            "android.permission.CAMERA",
+        ),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+    "microphone_access": {
+        "description": "Records audio from the microphone or output stream.",
+        "permissions": (
+            "android.permission.RECORD_AUDIO",
+            "android.permission.CAPTURE_AUDIO_OUTPUT",
+        ),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+    "external_storage": {
+        "description": "Reads or writes shared/external storage and media.",
+        "permissions": (
+            "android.permission.READ_EXTERNAL_STORAGE",
+            "android.permission.WRITE_EXTERNAL_STORAGE",
+            "android.permission.MANAGE_EXTERNAL_STORAGE",
+            "android.permission.READ_MEDIA_IMAGES",
+            "android.permission.READ_MEDIA_VIDEO",
+            "android.permission.READ_MEDIA_AUDIO",
+            "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        ),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+    "contacts_access": {
+        "description": "Reads or writes the contacts database or account list.",
+        "permissions": (
+            "android.permission.READ_CONTACTS",
+            "android.permission.WRITE_CONTACTS",
+            "android.permission.GET_ACCOUNTS",
+        ),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+    "sms_capabilities": {
+        "description": "Sends, receives, or reads SMS/MMS messages.",
+        "permissions": (
+            "android.permission.SEND_SMS",
+            "android.permission.READ_SMS",
+            "android.permission.RECEIVE_SMS",
+            "android.permission.RECEIVE_MMS",
+            "android.permission.RECEIVE_WAP_PUSH",
+        ),
+        "intent_actions": (
+            "android.provider.Telephony.SMS_RECEIVED",
+            "android.provider.Telephony.SMS_DELIVER",
+            "android.provider.Telephony.WAP_PUSH_RECEIVED",
+        ),
+        "manifest_flags": (),
+    },
+    "phone_capabilities": {
+        "description": "Reads phone state, places calls, or processes outgoing calls.",
+        "permissions": (
+            "android.permission.READ_PHONE_STATE",
+            "android.permission.READ_PHONE_NUMBERS",
+            "android.permission.CALL_PHONE",
+            "android.permission.PROCESS_OUTGOING_CALLS",
+            "android.permission.ANSWER_PHONE_CALLS",
+            "android.permission.READ_CALL_LOG",
+            "android.permission.WRITE_CALL_LOG",
+        ),
+        "intent_actions": (
+            "android.intent.action.PHONE_STATE",
+            "android.intent.action.NEW_OUTGOING_CALL",
+        ),
+        "manifest_flags": (),
+    },
+    "biometric_auth": {
+        "description": "Uses biometric authentication (fingerprint, face).",
+        "permissions": (
+            "android.permission.USE_BIOMETRIC",
+            "android.permission.USE_FINGERPRINT",
+        ),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+    "background_execution": {
+        "description": "Runs work outside of normal UI lifecycle (services, alarms, boot receivers).",
+        "permissions": (
+            "android.permission.FOREGROUND_SERVICE",
+            "android.permission.WAKE_LOCK",
+            "android.permission.RECEIVE_BOOT_COMPLETED",
+            "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+            "android.permission.SCHEDULE_EXACT_ALARM",
+            "android.permission.USE_EXACT_ALARM",
+        ),
+        "intent_actions": (
+            "android.intent.action.BOOT_COMPLETED",
+            "android.intent.action.MY_PACKAGE_REPLACED",
+        ),
+        "manifest_flags": (),
+    },
+    "device_admin": {
+        "description": "Acts as a device administrator (lock, wipe, password policy).",
+        "permissions": (
+            "android.permission.BIND_DEVICE_ADMIN",
+        ),
+        "intent_actions": (
+            "android.app.action.DEVICE_ADMIN_ENABLED",
+        ),
+        "manifest_flags": (),
+    },
+    "accessibility_service": {
+        "description": "Implements an accessibility service (can observe other apps' UI).",
+        "permissions": (
+            "android.permission.BIND_ACCESSIBILITY_SERVICE",
+        ),
+        "intent_actions": (
+            "android.accessibilityservice.AccessibilityService",
+        ),
+        "manifest_flags": (),
+    },
+    "package_management": {
+        "description": "Installs, removes, or enumerates other installed packages.",
+        "permissions": (
+            "android.permission.REQUEST_INSTALL_PACKAGES",
+            "android.permission.REQUEST_DELETE_PACKAGES",
+            "android.permission.INSTALL_PACKAGES",
+            "android.permission.DELETE_PACKAGES",
+            "android.permission.QUERY_ALL_PACKAGES",
+        ),
+        "intent_actions": (
+            "android.intent.action.PACKAGE_ADDED",
+            "android.intent.action.PACKAGE_REMOVED",
+            "android.intent.action.PACKAGE_REPLACED",
+        ),
+        "manifest_flags": (),
+    },
+    "notifications": {
+        "description": "Posts user-facing notifications or listens to others' notifications.",
+        "permissions": (
+            "android.permission.POST_NOTIFICATIONS",
+            "android.permission.BIND_NOTIFICATION_LISTENER_SERVICE",
+        ),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+    "bluetooth_access": {
+        "description": "Discovers or pairs with Bluetooth devices.",
+        "permissions": (
+            "android.permission.BLUETOOTH",
+            "android.permission.BLUETOOTH_ADMIN",
+            "android.permission.BLUETOOTH_CONNECT",
+            "android.permission.BLUETOOTH_SCAN",
+            "android.permission.BLUETOOTH_ADVERTISE",
+        ),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+    "nfc_access": {
+        "description": "Reads or writes NFC tags / runs HCE services.",
+        "permissions": (
+            "android.permission.NFC",
+            "android.permission.NFC_PREFERRED_PAYMENT_INFO",
+            "android.permission.NFC_TRANSACTION_EVENT",
+        ),
+        "intent_actions": (
+            "android.nfc.action.NDEF_DISCOVERED",
+            "android.nfc.action.TECH_DISCOVERED",
+            "android.nfc.action.TAG_DISCOVERED",
+        ),
+        "manifest_flags": (),
+    },
+    "deep_linking": {
+        "description": "Handles web/scheme deep links — entry point for external invocation.",
+        "permissions": (),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+    "exported_components": {
+        "description": "Has at least one exported component reachable by other apps.",
+        "permissions": (),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+    "debuggable_build": {
+        "description": "Built with android:debuggable=true (allows runtime introspection by other apps).",
+        "permissions": (),
+        "intent_actions": (),
+        "manifest_flags": (
+            ("application", "debuggable", "true"),
+        ),
+    },
+    "cleartext_traffic_allowed": {
+        "description": "Allows cleartext HTTP traffic (android:usesCleartextTraffic=true).",
+        "permissions": (),
+        "intent_actions": (),
+        "manifest_flags": (
+            ("application", "usesCleartextTraffic", "true"),
+        ),
+    },
+    "backup_allowed": {
+        "description": "App data is included in cloud/USB backups (android:allowBackup=true).",
+        "permissions": (),
+        "intent_actions": (),
+        "manifest_flags": (
+            ("application", "allowBackup", "true"),
+        ),
+    },
+    "custom_network_security_config": {
+        "description": "Declares a custom networkSecurityConfig XML (per-domain TLS rules, pinning, cleartext exceptions).",
+        "permissions": (),
+        "intent_actions": (),
+        "manifest_flags": (
+            ("application", "networkSecurityConfig", None),
+        ),
+    },
+    "modern_signing_scheme": {
+        "description": "Signed with APK Signature Scheme v2 / v3 / v3.1 — Janus-resistant on API >= 26.",
+        "permissions": (),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+    "legacy_signing_scheme_only": {
+        "description": "Signed ONLY with v1 (JAR signing) — vulnerable to Janus (CVE-2017-13156) on API <= 25.",
+        "permissions": (),
+        "intent_actions": (),
+        "manifest_flags": (),
+    },
+}
+
+
+# Pre-derived sets so the "is this declared permission/action known
+# to any catalogue capability?" lookup is O(1) in the inner loop.
+_CATALOGUED_PERMISSIONS: frozenset[str] = frozenset(
+    perm
+    for cap in _MOBILE_CAPABILITIES.values()
+    for perm in cap["permissions"]
+)
+_CATALOGUED_INTENT_ACTIONS: frozenset[str] = frozenset(
+    action
+    for cap in _MOBILE_CAPABILITIES.values()
+    for action in cap["intent_actions"]
+)
+
+# Deep-link intent-filter signature: action=VIEW + category=BROWSABLE
+# must both appear on the same intent-filter for a deep link to
+# fire — the system's Activity-resolution code requires BROWSABLE
+# to dispatch a VIEW from an external context.
+_DEEP_LINK_ACTION = "android.intent.action.VIEW"
+_DEEP_LINK_CATEGORY = "android.intent.category.BROWSABLE"
+
+# Component kinds androguard iterates when collecting intent filters
+# and exported-component candidates.
+_COMPONENT_KINDS: tuple[str, ...] = (
+    "activity",
+    "service",
+    "receiver",
+    "provider",
+)
+
+# APK signing-scheme labels exposed in evidence + the legacy/modern
+# verdicts. v3.1 is grouped with the modern set.
+_MODERN_SIGNING_SCHEMES: frozenset[str] = frozenset({"v2", "v3", "v3.1"})
+
+
 def register(mcp: Any) -> None:
     @mcp.tool()
     async def find_secrets(
@@ -437,6 +845,118 @@ def register(mcp: Any) -> None:
             encoding="utf-8",
         )
         return payload
+
+    @mcp.tool()
+    async def verify_capabilities(apk_path: str) -> MobileCapabilityProfile:
+        """Project an APK onto the mobile-capabilities catalogue.
+
+        Reads the APK via androguard (single in-process pass, no
+        external binary required) and matches its declared
+        permissions, intent-filter actions, exported components,
+        application-level manifest flags, and APK signing schemes
+        against :data:`_MOBILE_CAPABILITIES`. Returns a
+        :class:`MobileCapabilityProfile` mirroring audit-mcp's
+        ``verify_capabilities`` envelope so the VR persona prompt
+        template translates directly between the two MCP surfaces.
+
+        Three categories are derived out-of-band — they don't fit
+        the flat (permission, action, flag) catalogue model:
+        ``exported_components`` (any component reachable from other
+        apps), ``deep_linking`` (a VIEW + BROWSABLE intent-filter
+        pair on the same component), and the
+        ``modern_signing_scheme`` / ``legacy_signing_scheme_only``
+        verdicts (read from the v1/v2/v3/v3.1 signature blocks on
+        the APK).
+
+        Args:
+            apk_path: Absolute (or ``~``-relative) path to the APK
+                on the server filesystem.
+
+        Returns:
+            :class:`MobileCapabilityProfile` with three lists:
+
+            * ``confirmed``: each capability the APK exercises,
+              with a deduplicated ``evidence`` list naming the
+              specific permission / action / component / manifest
+              flag / signing scheme that triggered it.
+            * ``absent``: each catalogue capability this APK does
+              NOT exercise. Surfaced so the consumer can show
+              "not present" facts without re-deriving the
+              catalogue.
+            * ``uncategorized``: permissions and intent actions
+                the APK declares that no catalogue capability
+                knows about — the catalogue's growth list.
+
+        Raises:
+            FileNotFoundError: ``apk_path`` does not exist.
+            ValueError: ``apk_path`` exists but is not a file.
+        """
+        from androguard.core.apk import APK  # local — keeps cold-start fast
+
+        apk_p = Path(apk_path).expanduser().resolve()
+        if not apk_p.exists():
+            raise FileNotFoundError(f"apk not found: {apk_p}")
+        if not apk_p.is_file():
+            raise ValueError(f"apk_path is not a file: {apk_p}")
+
+        a = APK(str(apk_p))
+
+        declared_permissions = sorted(_safe_call(a.get_permissions) or [])
+        declared_permissions_set = set(declared_permissions)
+
+        intent_actions_by_component = _collect_intent_actions_by_component(a)
+        all_declared_actions = sorted({
+            action
+            for actions in intent_actions_by_component.values()
+            for action in actions
+        })
+        all_declared_actions_set = set(all_declared_actions)
+
+        exported_components = _collect_exported_components(a)
+        signing_schemes = _detect_signing_schemes(a)
+        deep_link_components = _collect_deep_link_components(a)
+
+        confirmed: list[ConfirmedCapability] = []
+        absent: list[AbsentCapability] = []
+
+        for cap_name, cap_info in _MOBILE_CAPABILITIES.items():
+            evidence = _evaluate_capability(
+                cap_name,
+                cap_info,
+                declared_permissions_set=declared_permissions_set,
+                all_declared_actions_set=all_declared_actions_set,
+                exported_components=exported_components,
+                deep_link_components=deep_link_components,
+                signing_schemes=signing_schemes,
+                apk=a,
+            )
+            if evidence:
+                confirmed.append(ConfirmedCapability(
+                    name=cap_name,
+                    description=cap_info["description"],
+                    evidence=evidence,
+                ))
+            else:
+                absent.append(AbsentCapability(
+                    name=cap_name,
+                    description=cap_info["description"],
+                ))
+
+        uncategorized: list[UncategorizedItem] = []
+        for perm in declared_permissions:
+            if perm not in _CATALOGUED_PERMISSIONS:
+                uncategorized.append(UncategorizedItem(kind="permission", name=perm))
+        for action in all_declared_actions:
+            if action not in _CATALOGUED_INTENT_ACTIONS:
+                uncategorized.append(UncategorizedItem(kind="intent_action", name=action))
+
+        return MobileCapabilityProfile(
+            package=_safe_call(a.get_package),
+            apk_path=str(apk_p),
+            confirmed=confirmed,
+            absent=absent,
+            uncategorized=uncategorized,
+        )
 
 
 # ---------------------------------------------------------------------
@@ -780,3 +1300,286 @@ def _safe_call(callable_: Any) -> Any:
     except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
         _log.debug("safe_call failed: %s", exc)
         return None
+
+
+# ---------------------------------------------------------------------
+# Helpers — verify_capabilities
+# ---------------------------------------------------------------------
+
+def _collect_intent_actions_by_component(apk: Any) -> dict[tuple[str, str], list[str]]:
+    """Walk every (kind, component_name) and pull its intent-filter actions.
+
+    Returns ``{(kind, name): [action_fqn, ...]}``. ``kind`` is one of
+    ``activity`` / ``service`` / ``receiver`` / ``provider``. The list
+    is deduplicated per component but order is preserved as androguard
+    yielded it so the caller can fingerprint a manifest exactly.
+    """
+    out: dict[tuple[str, str], list[str]] = {}
+    for kind in _COMPONENT_KINDS:
+        names = _safe_call(_bound_component_getter(apk, kind)) or []
+        for name in names:
+            filters = _safe_intent_filters(apk, kind, name)
+            actions = _extract_actions_from_filters(filters)
+            if actions:
+                out[(kind, name)] = actions
+    return out
+
+
+# Androguard's component getters do not pluralize uniformly — they
+# are ``get_activities`` (with ``-ies``), ``get_services``,
+# ``get_receivers``, ``get_providers``. Map kind → method name.
+_COMPONENT_GETTERS: dict[str, str] = {
+    "activity": "get_activities",
+    "service": "get_services",
+    "receiver": "get_receivers",
+    "provider": "get_providers",
+}
+
+
+def _bound_component_getter(apk: Any, kind: str) -> Any:
+    """Return the ``a.get_activities`` / ``get_services`` / ... bound method.
+
+    Returns ``None`` when the attribute is absent so :func:`_safe_call`
+    treats it as an empty list.
+    """
+    method_name = _COMPONENT_GETTERS.get(kind)
+    if method_name is None:
+        return None
+    return getattr(apk, method_name, None)
+
+
+def _safe_intent_filters(apk: Any, kind: str, name: str) -> Any:
+    """Call ``apk.get_intent_filters(kind, name)`` defensively.
+
+    Androguard occasionally raises on malformed components (binary
+    XML decode failure on obfuscated manifests); returning ``{}``
+    keeps the catalogue scan going for the rest of the components.
+    """
+    try:
+        return apk.get_intent_filters(kind, name)
+    except (AttributeError, TypeError, ValueError, KeyError) as exc:
+        _log.debug("get_intent_filters failed for %s/%s: %s", kind, name, exc)
+        return {}
+
+
+def _extract_actions_from_filters(filters: Any) -> list[str]:
+    """Pull a flat, ordered, deduped action list out of androguard's filters payload.
+
+    Androguard returns either a single ``{"action": [...], "category":
+    [...], "data": [...]}`` dict OR a list of those dicts depending on
+    component shape and version. Both are handled here so the caller
+    never has to special-case.
+    """
+    if not filters:
+        return []
+    if isinstance(filters, dict):
+        return _dedupe_preserve_order(filters.get("action") or [])
+    if isinstance(filters, list):
+        out: list[str] = []
+        for entry in filters:
+            if isinstance(entry, dict):
+                out.extend(entry.get("action") or [])
+        return _dedupe_preserve_order(out)
+    return []
+
+
+def _collect_categories_from_filters(filters: Any) -> list[str]:
+    """Pull the dedup'd category list out of an intent-filters payload."""
+    if not filters:
+        return []
+    if isinstance(filters, dict):
+        return _dedupe_preserve_order(filters.get("category") or [])
+    if isinstance(filters, list):
+        out: list[str] = []
+        for entry in filters:
+            if isinstance(entry, dict):
+                out.extend(entry.get("category") or [])
+        return _dedupe_preserve_order(out)
+    return []
+
+
+def _dedupe_preserve_order(items: Any) -> list[str]:
+    """Deduplicate ``items`` keeping first-seen order. Non-string entries dropped."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items or []:
+        if not isinstance(item, str) or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _collect_exported_components(apk: Any) -> list[dict[str, str]]:
+    """Return components reachable from other apps.
+
+    Mirrors ``tools/androguard.py``'s exported-component scan: a
+    component counts as exported when android:exported is literally
+    ``"true"`` OR when the component has at least one intent-filter
+    (Android treats unfiltered components as effectively exported on
+    older SDKs). Each entry is ``{kind, name}`` for evidence shape.
+    """
+    out: list[dict[str, str]] = []
+    for kind in _COMPONENT_KINDS:
+        names = _safe_call(_bound_component_getter(apk, kind)) or []
+        for name in names:
+            if _is_component_exported(apk, kind, name):
+                out.append({"kind": kind, "name": name})
+    return out
+
+
+def _is_component_exported(apk: Any, kind: str, name: str) -> bool:
+    """True when the component has android:exported=true OR any intent-filter."""
+    exported_attr = _safe_attribute_value(apk, kind, "exported", name=name)
+    if exported_attr.strip().lower() == "true":
+        return True
+    filters = _safe_intent_filters(apk, kind, name)
+    return bool(_extract_actions_from_filters(filters))
+
+
+def _safe_attribute_value(apk: Any, tag: str, attr: str, **kwargs: Any) -> str:
+    """Call ``apk.get_attribute_value(tag, attr, **kwargs)`` defensively.
+
+    Returns the empty string on any failure so callers can compare
+    against ``"true"`` / ``"false"`` / specific resource ids without
+    branching on exception types.
+    """
+    getter = getattr(apk, "get_attribute_value", None)
+    if not callable(getter):
+        return ""
+    try:
+        result = getter(tag, attr, **kwargs)
+    except (AttributeError, TypeError, ValueError, KeyError) as exc:
+        _log.debug("get_attribute_value failed for %s/%s: %s", tag, attr, exc)
+        return ""
+    return result if isinstance(result, str) else ""
+
+
+def _detect_signing_schemes(apk: Any) -> list[str]:
+    """Detect which APK signing schemes are present.
+
+    Returns a list in canonical order (``v1, v2, v3, v3.1``) of the
+    schemes that actually have certificate blocks on the APK.
+    Androguard exposes ``get_certificates_v{1,2,3,31}`` — any non-
+    empty return means the scheme is present.
+    """
+    schemes: list[str] = []
+    for getter_name, label in (
+        ("get_certificates_v1", "v1"),
+        ("get_certificates_v2", "v2"),
+        ("get_certificates_v3", "v3"),
+        ("get_certificates_v31", "v3.1"),
+    ):
+        certs = _safe_call(getattr(apk, getter_name, None))
+        if certs:
+            schemes.append(label)
+    return schemes
+
+
+def _collect_deep_link_components(apk: Any) -> list[dict[str, str]]:
+    """Components with a VIEW + BROWSABLE intent-filter on the same filter.
+
+    Both must appear on the same intent-filter for the Android runtime
+    to dispatch a deep link from an external context. Returns
+    ``[{kind, name}]`` for use as evidence detail.
+    """
+    out: list[dict[str, str]] = []
+    for kind in _COMPONENT_KINDS:
+        names = _safe_call(_bound_component_getter(apk, kind)) or []
+        for name in names:
+            filters = _safe_intent_filters(apk, kind, name)
+            if _filters_have_view_browsable_pair(filters):
+                out.append({"kind": kind, "name": name})
+    return out
+
+
+def _filters_have_view_browsable_pair(filters: Any) -> bool:
+    """True when at least one intent-filter has BOTH VIEW + BROWSABLE."""
+    if not filters:
+        return False
+    # When androguard returns a single filter dict, treat actions and
+    # categories as belonging to the same filter — that's the common
+    # case (one intent-filter per component slot).
+    if isinstance(filters, dict):
+        actions = filters.get("action") or []
+        categories = filters.get("category") or []
+        return _DEEP_LINK_ACTION in actions and _DEEP_LINK_CATEGORY in categories
+    if isinstance(filters, list):
+        for entry in filters:
+            if not isinstance(entry, dict):
+                continue
+            actions = entry.get("action") or []
+            categories = entry.get("category") or []
+            if _DEEP_LINK_ACTION in actions and _DEEP_LINK_CATEGORY in categories:
+                return True
+    return False
+
+
+def _evaluate_capability(
+    cap_name: str,
+    cap_info: dict[str, Any],
+    *,
+    declared_permissions_set: set[str],
+    all_declared_actions_set: set[str],
+    exported_components: list[dict[str, str]],
+    deep_link_components: list[dict[str, str]],
+    signing_schemes: list[str],
+    apk: Any,
+) -> list[CapabilityEvidence]:
+    """Compute the evidence list for one catalogue entry.
+
+    Walks the catalogue entry's permissions / intent_actions /
+    manifest_flags against the collected APK signals, then layers
+    the four special-cased capabilities on top:
+
+        exported_components            — any entry in
+                                         ``exported_components``
+        deep_linking                   — any entry in
+                                         ``deep_link_components``
+        modern_signing_scheme          — any scheme in
+                                         ``_MODERN_SIGNING_SCHEMES``
+        legacy_signing_scheme_only     — schemes == {"v1"}
+
+    Evidence order is deterministic: catalogue-driven matches first
+    (permission, then intent_action, then manifest_flag) and
+    special-case evidence last. This gives the reviewer the same
+    reading order for every capability.
+    """
+    evidence: list[CapabilityEvidence] = []
+
+    for perm in cap_info["permissions"]:
+        if perm in declared_permissions_set:
+            evidence.append(CapabilityEvidence(source="permission", detail=perm))
+
+    for action in cap_info["intent_actions"]:
+        if action in all_declared_actions_set:
+            evidence.append(CapabilityEvidence(source="intent_action", detail=action))
+
+    for tag, attr, expected in cap_info["manifest_flags"]:
+        actual = _safe_attribute_value(apk, tag, attr)
+        if not actual:
+            continue
+        if expected is None or actual.strip().lower() == expected.strip().lower():
+            detail = f"{tag}.{attr}={actual}"
+            evidence.append(CapabilityEvidence(source="manifest_flag", detail=detail))
+
+    if cap_name == "exported_components":
+        for comp in exported_components:
+            detail = f"{comp['kind']}:{comp['name']}"
+            evidence.append(CapabilityEvidence(source="exported_component", detail=detail))
+
+    if cap_name == "deep_linking":
+        for comp in deep_link_components:
+            detail = f"VIEW+BROWSABLE@{comp['kind']}:{comp['name']}"
+            evidence.append(CapabilityEvidence(source="intent_filter", detail=detail))
+
+    if cap_name == "modern_signing_scheme":
+        for scheme in signing_schemes:
+            if scheme in _MODERN_SIGNING_SCHEMES:
+                evidence.append(CapabilityEvidence(source="signing_scheme", detail=scheme))
+
+    if cap_name == "legacy_signing_scheme_only":
+        if signing_schemes == ["v1"]:
+            evidence.append(CapabilityEvidence(source="signing_scheme", detail="v1"))
+
+    return evidence

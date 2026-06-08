@@ -80,9 +80,9 @@ def test_http_app_builds() -> None:
 # lief_so (1), mobsf_static (1), objection (2), qark (1),
 # yara_decompiled (1) — total 20 handlers across 13 wrapper modules.
 #
-# Composite currently ships 2 of the 4 PRD §A composite tools; the
-# other 2 (``verify_capabilities`` / ``compute_risk_score``) land
-# alongside A-10 / A-12 and the floor grows then.
+# Composite currently ships 3 of the 4 PRD §A composite tools; the
+# remaining one (``compute_risk_score``) lands alongside A-12 and
+# the floor grows then.
 _EXPECTED_PER_TOOL_HANDLERS: frozenset[str] = frozenset({
     "adb_devices",
     "adb_install",
@@ -109,6 +109,7 @@ _EXPECTED_PER_TOOL_HANDLERS: frozenset[str] = frozenset({
 _EXPECTED_COMPOSITE_HANDLERS: frozenset[str] = frozenset({
     "classify_behavior",
     "find_secrets",
+    "verify_capabilities",
 })
 
 
