@@ -7,14 +7,19 @@ manually.
 
 Implemented so far:
 
-    find_secrets    — hardcoded credentials / API keys / PEM blocks /
-                      JWTs / Firebase URLs across a decompiled tree
-                      plus an optional extra assets dir.
+    find_secrets        — hardcoded credentials / API keys / PEM blocks /
+                          JWTs / Firebase URLs across a decompiled tree
+                          plus an optional extra assets dir.
+    classify_behavior   — maps the API surface used by the dex bytecode
+                          (via androguard's call-graph analysis) to
+                          ATT&CK-aligned categories (network, crypto,
+                          reflection, IPC, SMS, location, dynamic-code-
+                          loading, native-exec, webview, …). Drops the
+                          report at ``<workdir>/<sha[:16]>/behavior.json``.
 
-Reserved per PRD §A-10..A-12 for follow-up iterations:
+Reserved per PRD §A-10 + §A-12 for follow-up iterations:
 
     verify_capabilities
-    classify_behavior
     compute_risk_score
 
 Each composite handler is registered via :func:`register` and follows
@@ -25,8 +30,11 @@ endpoints, AILA's bridge) treats it identically.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
+import os
 import re
 from pathlib import Path
 from typing import Any, Iterator
@@ -143,6 +151,162 @@ _PATTERNS: tuple[tuple[str, re.Pattern[bytes], bool, bool], ...] = (
     ),
 )
 
+# Behavior-category map for ``classify_behavior``.
+#
+# Each category lists ATT&CK Mobile technique IDs the category maps to
+# (https://attack.mitre.org/matrices/mobile/), a one-line description,
+# and a tuple of ``(class_dotted, method)`` pairs that fingerprint the
+# behaviour. The dotted form mirrors how the operator reads the API in
+# Java/Kotlin source; the helpers below translate it to the smali
+# signature androguard's ``find_methods`` expects.
+#
+# Curated to keep noise low: methods listed here are the canonical
+# entry points the Android dev guides + a13e malware-analysis catalogues
+# point at. Adding more APIs is mechanically safe — each entry is
+# isolated; an unknown class/method simply produces zero callers.
+_BEHAVIOR_CATEGORIES: dict[str, dict[str, Any]] = {
+    "network": {
+        "attack_techniques": ["T1437.001"],
+        "description": "Application-layer network egress (HTTP/HTTPS).",
+        "apis": (
+            ("java.net.URL", "openConnection"),
+            ("java.net.HttpURLConnection", "connect"),
+            ("javax.net.ssl.HttpsURLConnection", "connect"),
+            ("okhttp3.OkHttpClient", "newCall"),
+            ("org.apache.http.client.HttpClient", "execute"),
+        ),
+    },
+    "crypto": {
+        "attack_techniques": ["T1521"],
+        "description": "Cryptographic primitive use (Cipher / MessageDigest / KeyGenerator).",
+        "apis": (
+            ("javax.crypto.Cipher", "getInstance"),
+            ("java.security.MessageDigest", "getInstance"),
+            ("javax.crypto.KeyGenerator", "getInstance"),
+            ("javax.crypto.Mac", "getInstance"),
+        ),
+    },
+    "reflection": {
+        "attack_techniques": ["T1623", "T1407"],
+        "description": "Runtime reflection — Class.forName, Method.invoke, Field reads.",
+        "apis": (
+            ("java.lang.Class", "forName"),
+            ("java.lang.reflect.Method", "invoke"),
+            ("java.lang.reflect.Field", "get"),
+        ),
+    },
+    "ipc": {
+        "attack_techniques": ["T1437"],
+        "description": "Cross-component IPC — content providers, intents, broadcasts.",
+        "apis": (
+            ("android.content.ContentResolver", "query"),
+            ("android.content.Context", "startActivity"),
+            ("android.content.Context", "sendBroadcast"),
+            ("android.content.Context", "bindService"),
+        ),
+    },
+    "sms": {
+        "attack_techniques": ["T1582"],
+        "description": "SMS send paths (premium-SMS abuse / 2FA exfil).",
+        "apis": (
+            ("android.telephony.SmsManager", "sendTextMessage"),
+            ("android.telephony.SmsManager", "sendMultipartTextMessage"),
+            ("android.telephony.SmsManager", "sendDataMessage"),
+        ),
+    },
+    "location": {
+        "attack_techniques": ["T1430"],
+        "description": "Location tracking (LocationManager, fused-location).",
+        "apis": (
+            ("android.location.LocationManager", "getLastKnownLocation"),
+            ("android.location.LocationManager", "requestLocationUpdates"),
+            ("com.google.android.gms.location.FusedLocationProviderClient", "getLastLocation"),
+        ),
+    },
+    "storage": {
+        "attack_techniques": ["T1409"],
+        "description": "Persistent storage writes — file streams + SQLite.",
+        "apis": (
+            ("java.io.FileOutputStream", "<init>"),
+            ("android.database.sqlite.SQLiteDatabase", "openDatabase"),
+            ("android.database.sqlite.SQLiteOpenHelper", "getWritableDatabase"),
+        ),
+    },
+    "dynamic_loading": {
+        "attack_techniques": ["T1407"],
+        "description": "Runtime code loading (DexClassLoader, PathClassLoader, in-memory dex).",
+        "apis": (
+            ("dalvik.system.DexClassLoader", "<init>"),
+            ("dalvik.system.PathClassLoader", "<init>"),
+            ("dalvik.system.InMemoryDexClassLoader", "<init>"),
+            ("dalvik.system.BaseDexClassLoader", "<init>"),
+        ),
+    },
+    "native_exec": {
+        "attack_techniques": ["T1623.001"],
+        "description": "Shell / process spawning (Runtime.exec, ProcessBuilder).",
+        "apis": (
+            ("java.lang.Runtime", "exec"),
+            ("java.lang.ProcessBuilder", "start"),
+        ),
+    },
+    "webview": {
+        "attack_techniques": ["T1437"],
+        "description": "WebView bridge surface — URL loading + JS-interface exposure.",
+        "apis": (
+            ("android.webkit.WebView", "loadUrl"),
+            ("android.webkit.WebView", "addJavascriptInterface"),
+            ("android.webkit.WebView", "evaluateJavascript"),
+            ("android.webkit.WebView", "loadData"),
+            ("android.webkit.WebView", "loadDataWithBaseURL"),
+        ),
+    },
+    "camera": {
+        "attack_techniques": ["T1512"],
+        "description": "Camera capture (legacy Camera API + CameraX bindings).",
+        "apis": (
+            ("android.hardware.Camera", "open"),
+            ("android.hardware.camera2.CameraManager", "openCamera"),
+        ),
+    },
+    "microphone": {
+        "attack_techniques": ["T1429"],
+        "description": "Audio capture (MediaRecorder + AudioRecord).",
+        "apis": (
+            ("android.media.MediaRecorder", "start"),
+            ("android.media.AudioRecord", "startRecording"),
+        ),
+    },
+    "device_info": {
+        "attack_techniques": ["T1426"],
+        "description": "Device-identifying reads (IMEI / SIM serial / subscriber id).",
+        "apis": (
+            ("android.telephony.TelephonyManager", "getDeviceId"),
+            ("android.telephony.TelephonyManager", "getImei"),
+            ("android.telephony.TelephonyManager", "getSubscriberId"),
+            ("android.telephony.TelephonyManager", "getSimSerialNumber"),
+            ("android.provider.Settings$Secure", "getString"),
+        ),
+    },
+    "clipboard": {
+        "attack_techniques": ["T1414"],
+        "description": "Clipboard read/write — credential-harvesting + clipper malware.",
+        "apis": (
+            ("android.content.ClipboardManager", "getPrimaryClip"),
+            ("android.content.ClipboardManager", "setPrimaryClip"),
+            ("android.content.ClipboardManager", "addPrimaryClipChangedListener"),
+        ),
+    },
+}
+
+# Behavior-report workdir. Mirrors the apktool / jadx convention so
+# the operator's three composite reports land under predictable
+# adjacent paths (``<workdir>/apktool-<sha>/``, ``<workdir>/jadx-<sha>/``,
+# ``<workdir>/<sha[:16]>/behavior.json``). Override via env var.
+_DEFAULT_BEHAVIOR_WORKDIR = Path(
+    os.environ.get("ANDROID_MCP_WORKDIR", "~/.android-mcp/work")
+).expanduser()
+
 
 def register(mcp: Any) -> None:
     @mcp.tool()
@@ -190,6 +354,89 @@ def register(mcp: Any) -> None:
             for file_path in _iter_scan_targets(root):
                 results.extend(_scan_file(file_path))
         return results
+
+    @mcp.tool()
+    async def classify_behavior(
+        apk_path: str,
+        workdir: str | None = None,
+    ) -> dict[str, Any]:
+        """Map an APK's dex API surface to ATT&CK-aligned behavior categories.
+
+        Runs ``androguard.misc.AnalyzeAPK`` against ``apk_path`` then,
+        for each ``(class, method)`` pair in
+        :data:`_BEHAVIOR_CATEGORIES`, walks ``Analysis.find_methods``'
+        xref-from list to collect every internal caller. The result
+        is a per-category roll-up of which ATT&CK techniques the APK
+        exercises and which application methods reach them.
+
+        Writes the same payload to
+        ``<workdir>/<sha256[:16]>/behavior.json`` (override the workdir
+        via the ``workdir`` arg, or the ``ANDROID_MCP_WORKDIR`` env
+        var). The on-disk copy is what other tools and AILA's bridge
+        layer read back without re-running androguard.
+
+        Args:
+            apk_path: Absolute (or ``~``-relative) path to the APK.
+            workdir: Optional base dir for the behavior report. When
+                ``None``, falls back to ``ANDROID_MCP_WORKDIR`` or
+                ``~/.android-mcp/work``.
+
+        Returns:
+            ``{package, sha256_prefix, report_path, total_calls,
+              categories: {<name>: {attack_techniques, description,
+              calls: [{class, method, callers: [{caller_class,
+              caller_method, offset}], caller_count}], call_count}}}``.
+
+            Categories with zero callers are still listed (with empty
+            ``calls`` / ``call_count=0``) so the consumer can show
+            "absent" facts without re-deriving the schema.
+
+        Raises:
+            FileNotFoundError: ``apk_path`` does not exist.
+            ValueError: ``apk_path`` exists but is not a file.
+        """
+        from androguard.misc import AnalyzeAPK  # local — keeps cold-start fast
+
+        apk_p = Path(apk_path).expanduser().resolve()
+        if not apk_p.exists():
+            raise FileNotFoundError(f"apk not found: {apk_p}")
+        if not apk_p.is_file():
+            raise ValueError(f"apk_path is not a file: {apk_p}")
+
+        sha = _sha256_file(apk_p)
+        sha_prefix = sha[:16]
+        out_dir = _resolve_behavior_workdir(workdir) / sha_prefix
+        out_dir.mkdir(parents=True, exist_ok=True)
+        report_path = out_dir / "behavior.json"
+
+        apk_obj, _dex_list, dx = AnalyzeAPK(str(apk_p))
+
+        categories: dict[str, dict[str, Any]] = {}
+        total_calls = 0
+        for cat_name, cat_info in _BEHAVIOR_CATEGORIES.items():
+            calls = _collect_calls_for_category(dx, cat_info["apis"])
+            call_count = sum(c["caller_count"] for c in calls)
+            categories[cat_name] = {
+                "attack_techniques": list(cat_info["attack_techniques"]),
+                "description": cat_info["description"],
+                "calls": calls,
+                "call_count": call_count,
+            }
+            total_calls += call_count
+
+        payload: dict[str, Any] = {
+            "package": _safe_call(apk_obj.get_package),
+            "sha256_prefix": sha_prefix,
+            "report_path": str(report_path),
+            "total_calls": total_calls,
+            "categories": categories,
+        }
+
+        report_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return payload
 
 
 # ---------------------------------------------------------------------
@@ -377,3 +624,159 @@ def _shannon_entropy(data: bytes) -> float:
         counts[b] += 1
     n = len(data)
     return -sum((c / n) * math.log2(c / n) for c in counts if c)
+
+
+# ---------------------------------------------------------------------
+# Helpers — classify_behavior
+# ---------------------------------------------------------------------
+
+def _resolve_behavior_workdir(workdir: str | None) -> Path:
+    """Resolve the behavior-report workdir.
+
+    Precedence: explicit ``workdir`` arg → ``ANDROID_MCP_WORKDIR``
+    env var (already baked into :data:`_DEFAULT_BEHAVIOR_WORKDIR` at
+    import time) → ``~/.android-mcp/work``.
+    """
+    if workdir:
+        return Path(workdir).expanduser().resolve()
+    return _DEFAULT_BEHAVIOR_WORKDIR
+
+
+def _sha256_file(path: Path) -> str:
+    """SHA-256 the file at ``path`` in 1 MiB chunks. Hex digest."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _dotted_to_smali(dotted: str) -> str:
+    """Translate a dotted Java class name to androguard's smali signature.
+
+    ``java.net.URL`` -> ``Ljava/net/URL;``.
+    ``android.provider.Settings$Secure`` -> ``Landroid/provider/Settings$Secure;``.
+    Inner-class ``$`` is left as-is (smali keeps the ``$``).
+    """
+    return f"L{dotted.replace('.', '/')};"
+
+
+def _smali_to_dotted(smali: str) -> str:
+    """Translate a smali class signature back to dotted form.
+
+    ``Ljava/net/URL;`` -> ``java.net.URL``. Anything that does not
+    match the ``L...;`` shape is returned verbatim — useful for
+    array types (``[B``) and primitive descriptors.
+    """
+    if smali.startswith("L") and smali.endswith(";"):
+        return smali[1:-1].replace("/", ".")
+    return smali
+
+
+def _collect_calls_for_category(
+    dx: Any,
+    apis: tuple[tuple[str, str], ...],
+) -> list[dict[str, Any]]:
+    """Walk one category's API list, return per-API caller summaries.
+
+    For each ``(class_dotted, method)`` pair, asks androguard's
+    ``Analysis`` instance to enumerate every matching method node
+    (typically one external + zero-or-more internal overrides) and
+    collects each unique internal caller. External-method callers
+    are dropped — only application code that actually invokes the
+    API is interesting for behavior classification.
+
+    APIs with zero callers are omitted from the returned list so
+    the response stays focused on what the APK actually uses.
+    """
+    out: list[dict[str, Any]] = []
+    for class_dotted, method in apis:
+        smali_class = _dotted_to_smali(class_dotted)
+        # ``find_methods`` regexes match the smali signature. Anchor
+        # the class so ``Lcom/example/Foo;`` does not also catch
+        # ``Lcom/example/FooBar;``; ``re.escape`` handles ``$``
+        # inner-class separators and ``;`` terminators that would
+        # otherwise be meta-characters.
+        class_re = f"^{re.escape(smali_class)}$"
+        method_re = f"^{re.escape(method)}$"
+        callers: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, int]] = set()
+        try:
+            target_methods = list(dx.find_methods(classname=class_re, methodname=method_re))
+        except (AttributeError, TypeError, ValueError) as exc:
+            _log.debug(
+                "find_methods failed for %s.%s: %s", class_dotted, method, exc
+            )
+            continue
+        for tm in target_methods:
+            try:
+                xref_from = tm.get_xref_from()
+            except (AttributeError, TypeError) as exc:
+                _log.debug("get_xref_from failed on %s.%s: %s", class_dotted, method, exc)
+                continue
+            for entry in xref_from:
+                if len(entry) < 3:
+                    continue
+                _caller_class_analysis, caller_ma, offset = entry[0], entry[1], entry[2]
+                if _is_external(caller_ma):
+                    # callers that are themselves external are noise — we
+                    # only care about app code reaching the API
+                    continue
+                caller_smali = _safe_attr(caller_ma, "class_name", default="")
+                caller_method_name = _safe_attr(caller_ma, "name", default="")
+                try:
+                    offset_int = int(offset)
+                except (TypeError, ValueError):
+                    offset_int = -1
+                key = (str(caller_smali), str(caller_method_name), offset_int)
+                if key in seen:
+                    continue
+                seen.add(key)
+                callers.append({
+                    "caller_class": _smali_to_dotted(str(caller_smali)),
+                    "caller_method": str(caller_method_name),
+                    "offset": offset_int,
+                })
+        if callers:
+            out.append({
+                "class": class_dotted,
+                "method": method,
+                "callers": callers,
+                "caller_count": len(callers),
+            })
+    return out
+
+
+def _is_external(method_analysis: Any) -> bool:
+    """True when ``method_analysis`` represents an external (non-APK) method.
+
+    Androguard's ``MethodAnalysis.is_external()`` is the canonical
+    answer. Falls back to ``False`` when the attribute is absent —
+    test doubles often skip it and we want them treated as internal.
+    """
+    is_ext = getattr(method_analysis, "is_external", None)
+    if not callable(is_ext):
+        return False
+    try:
+        return bool(is_ext())
+    except (AttributeError, TypeError):
+        return False
+
+
+def _safe_attr(obj: Any, name: str, *, default: Any = None) -> Any:
+    """Read ``obj.name`` defensively, returning ``default`` on any failure."""
+    try:
+        return getattr(obj, name, default)
+    except (AttributeError, TypeError):
+        return default
+
+
+def _safe_call(callable_: Any) -> Any:
+    """Call ``callable_()`` defensively, returning ``None`` on any failure."""
+    if not callable(callable_):
+        return None
+    try:
+        return callable_()
+    except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
+        _log.debug("safe_call failed: %s", exc)
+        return None

@@ -19,7 +19,13 @@ async def _call_find_secrets(
     decompiled_dir: str,
     assets_dir: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Resolve the registered ``find_secrets`` handler and call it."""
+    """Resolve the registered ``find_secrets`` handler and call it.
+
+    ``composite.register`` now attaches more than one handler, so the
+    capture has to be keyed by ``fn.__name__`` — a single ``fn`` slot
+    silently picked up the last-registered tool (``classify_behavior``)
+    instead.
+    """
     from android_mcp.composite import register
 
     captured: dict[str, Any] = {}
@@ -27,14 +33,14 @@ async def _call_find_secrets(
     class _MCP:
         def tool(self):
             def deco(fn):
-                captured["fn"] = fn
+                captured[fn.__name__] = fn
                 return fn
 
             return deco
 
     register(_MCP())
-    fn = captured.get("fn")
-    assert callable(fn), "register did not capture find_secrets"
+    fn = captured.get("find_secrets")
+    assert callable(fn), f"register did not capture find_secrets (got: {sorted(captured)})"
     return await fn(decompiled_dir=decompiled_dir, assets_dir=assets_dir)
 
 
@@ -61,14 +67,15 @@ def test_register_attaches_find_secrets_handler() -> None:
     class _MCP:
         def tool(self):
             def deco(fn):
-                captured["fn"] = fn
+                captured[fn.__name__] = fn
                 return fn
 
             return deco
 
     register(_MCP())
-    assert callable(captured.get("fn"))
-    assert captured["fn"].__name__ == "find_secrets"
+    assert "find_secrets" in captured, f"find_secrets not registered (got: {sorted(captured)})"
+    assert callable(captured["find_secrets"])
+    assert captured["find_secrets"].__name__ == "find_secrets"
 
 
 # ---------------------------------------------------------------------
