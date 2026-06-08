@@ -26,10 +26,51 @@ mcp = FastMCP("android-mcp")
 
 
 def _register_all() -> None:
-    """Import every tool module and attach its handlers to the MCP."""
-    from .tools import androguard, apktool, jadx, mobsf_static
+    """Import every tool module and attach its handlers to the MCP.
 
-    for module in (apktool, jadx, mobsf_static, androguard):
+    Order: every per-tool wrapper under ``tools/`` first, then the
+    composite module under ``android_mcp/composite.py``. Composite
+    handlers depend on the per-tool wrappers being on the import
+    path but NOT on them being registered first — each composite
+    handler imports its own dependencies lazily inside the call.
+    Registering in this order keeps the failure mode predictable:
+    if a per-tool wrapper fails to register, the composite handlers
+    still surface and the operator sees both halves of the gap.
+    """
+    from . import composite
+    from .tools import (
+        adb,
+        androbugs,
+        androguard,
+        apksigner,
+        apktool,
+        drozer,
+        frida_helpers,
+        jadx,
+        lief_so,
+        mobsf_static,
+        objection,
+        qark,
+        yara_decompiled,
+    )
+
+    modules = (
+        adb,
+        androbugs,
+        androguard,
+        apksigner,
+        apktool,
+        drozer,
+        frida_helpers,
+        jadx,
+        lief_so,
+        mobsf_static,
+        objection,
+        qark,
+        yara_decompiled,
+        composite,
+    )
+    for module in modules:
         if not hasattr(module, "register"):
             _log.warning("tool module %s has no register() function — skipping", module.__name__)
             continue
