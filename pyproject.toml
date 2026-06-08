@@ -42,6 +42,7 @@ scanners = [
     # jadx, adb, drozer-agent, AndroBugs, MobSF) stay in the OS-prereq
     # README table — they cannot be expressed here.
     "qark>=4.0.0",
+    "objection>=1.11.0",
 ]
 dev = [
     "pytest>=8.0",
