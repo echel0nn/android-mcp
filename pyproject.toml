@@ -67,3 +67,6 @@ line-length = 120
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Make `pytest` work from a clean checkout without requiring PYTHONPATH=src
+# or `pip install -e .`. Standard pytest idiom for src/ layouts (pytest >= 7).
+pythonpath = ["src"]
