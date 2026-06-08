@@ -79,10 +79,11 @@ def test_http_app_builds() -> None:
 # apksigner (1), apktool (1), drozer (1), frida_helpers (3), jadx (1),
 # lief_so (1), mobsf_static (1), objection (2), qark (1),
 # yara_decompiled (1) — total 20 handlers across 13 wrapper modules.
-#
-# Composite currently ships 3 of the 4 PRD §A composite tools; the
-# remaining one (``compute_risk_score``) lands alongside A-12 and
-# the floor grows then.
+# Composite ships all 4 PRD §A composite tools as of A-12. The handler
+# floor below mirrors the registered set; adding a fifth composite tool
+# means growing this set + adding tests under
+# ``tests/test_composite_<name>.py`` and walking ``register`` to
+# capture the new function.
 _EXPECTED_PER_TOOL_HANDLERS: frozenset[str] = frozenset({
     "adb_devices",
     "adb_install",
@@ -110,6 +111,7 @@ _EXPECTED_COMPOSITE_HANDLERS: frozenset[str] = frozenset({
     "classify_behavior",
     "find_secrets",
     "verify_capabilities",
+    "compute_risk_score",
 })
 
 

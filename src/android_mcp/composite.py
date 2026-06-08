@@ -25,10 +25,14 @@ Implemented so far:
                           audit-mcp's ``verify_capabilities`` shape so
                           the VR persona prompt template translates
                           directly.
-
-Reserved per PRD §A-12 for follow-up iterations:
-
-    compute_risk_score
+    compute_risk_score  — aggregates verify_capabilities + LIEF native-
+                          lib hardening + (optional) drozer + MobSF
+                          outputs into a 0-100 score with a documented
+                          weighting table and a sorted ``top_factors``
+                          list. Caps and per-factor weights live as
+                          named module constants so the test suite
+                          asserts against the same numbers the
+                          handler docstring documents.
 
 Each composite handler is registered via :func:`register` and follows
 the same one-file-per-tool style as ``tools/<name>.py`` so the rest of
@@ -397,6 +401,51 @@ class MobileCapabilityProfile(BaseModel):
 
 
 # ---------------------------------------------------------------------
+# compute_risk_score — typed return models
+# ---------------------------------------------------------------------
+#
+# Each factor entry is a self-describing row the consumer can render
+# without re-deriving the weight table from the docstring. ``weight``
+# is the per-unit point value (the documented constant); ``contribution``
+# is what that factor actually added to the score (capped where the
+# factor has a cap, summed across multiple matches where it doesn't).
+# Splitting the two means the consumer can see "v1-only signing: 10pt
+# weight, 10pt contribution (single factor)" vs "exported components:
+# 15pt weight, 30pt contribution (cap reached, 7 components)" without
+# guessing which cap applies.
+
+
+class RiskFactor(BaseModel):
+    """One factor contributing to the overall risk score."""
+
+    factor: str
+    weight: int
+    contribution: int
+    evidence: list[str] = Field(default_factory=list)
+
+
+class RiskScore(BaseModel):
+    """0-100 risk verdict for an APK with the contributing factor list.
+
+    ``score`` is the capped total (max 100). ``raw_total`` is the same
+    sum before the 100-point cap so the consumer can see when an APK
+    is "off the chart" risky vs merely "everything is bad".
+    ``top_factors`` lists every factor with non-zero contribution,
+    sorted by contribution descending so ``top_factors[:5]`` is always
+    the "five worst" view a UI would want. ``missing_inputs`` names
+    the tool outputs the caller did not supply and the handler did not
+    auto-derive, so the consumer knows the score is partial.
+    """
+
+    score: int
+    package: str | None
+    apk_path: str
+    raw_total: int
+    top_factors: list[RiskFactor]
+    missing_inputs: list[str]
+
+
+# ---------------------------------------------------------------------
 # verify_capabilities — capabilities catalogue
 # ---------------------------------------------------------------------
 #
@@ -715,6 +764,74 @@ _COMPONENT_KINDS: tuple[str, ...] = (
 # verdicts. v3.1 is grouped with the modern set.
 _MODERN_SIGNING_SCHEMES: frozenset[str] = frozenset({"v2", "v3", "v3.1"})
 
+# ---------------------------------------------------------------------
+# compute_risk_score — weight table
+# ---------------------------------------------------------------------
+#
+# Per-unit weights and caps. The docstring on the registered handler
+# reproduces this table for the operator; keeping the numbers as
+# named constants here makes the underlying scoring math readable
+# and lets the tests reference the same values they assert against.
+#
+# Design: each factor weight reflects relative risk surface, not an
+# absolute CVSS-style severity. ``debuggable_build`` is heavier than
+# ``cleartext_traffic_allowed`` because a debuggable production
+# build means any app on the device can attach a JDWP debugger and
+# read arbitrary process memory — that's a wider hole than cleartext
+# HTTP. Caps cover factors whose count can balloon (drozer can
+# enumerate dozens of providers) so a single bad app doesn't
+# saturate the 100-point ceiling with one factor.
+
+_RISK_W_EXPORTED_COMPONENT = 15
+_RISK_CAP_EXPORTED_COMPONENT = 30
+_RISK_W_V1_ONLY_SIGNING = 10
+_RISK_W_WORLD_WRITABLE = 8
+_RISK_CAP_WORLD_WRITABLE = 24
+_RISK_W_MISSING_PINNING = 6
+_RISK_W_MISSING_PIE = 5
+_RISK_W_DEBUGGABLE = 12
+_RISK_W_CLEARTEXT = 7
+_RISK_W_BACKUP_ALLOWED = 4
+_RISK_W_MISSING_NX = 4
+_RISK_W_WEAK_RELRO_PARTIAL = 1
+_RISK_W_WEAK_RELRO_NONE = 3
+_RISK_W_MISSING_CANARY = 2
+_RISK_W_PROVIDER_INJECTION = 12
+_RISK_CAP_PROVIDER_INJECTION = 36
+
+# Overall 0-100 cap on the aggregated score. Raw totals above this
+# clip to 100; the ``raw_total`` field on :class:`RiskScore` still
+# carries the uncapped sum so the consumer sees the size of the
+# overage.
+_RISK_SCORE_CAP = 100
+
+# Substrings the MobSF code_analysis / findings rule IDs may carry
+# for the world-writable factor. MobSF's exact rule IDs drift
+# across releases (``android_world_writable``,
+# ``android_world_writable_files``, ``world_writable_files``) so
+# we match by substring rather than by exact ID.
+_MOBSF_WORLD_WRITABLE_TOKENS: tuple[str, ...] = (
+    "world_writable",
+    "world_readable",
+)
+
+# Substrings the MobSF code_analysis / findings rule IDs may carry
+# for the missing-pinning factor. MobSF reports pinning absence as
+# a finding (the rule "no certificate pinning detected" fires when
+# the static-analysis pass walks the dex and finds no
+# ``CertificatePinner``/``checkServerTrusted`` overrides). The
+# substring set covers both the OWASP MASVS rule IDs and MobSF's
+# native rule names.
+_MOBSF_MISSING_PINNING_TOKENS: tuple[str, ...] = (
+    "ssl_pinning",
+    "certificate_pinning",
+    "cert_pinning",
+    "pinning_missing",
+    "no_certificate_pinning",
+    "no_ssl_pinning",
+    "android_certificate_pinning",
+)
+
 
 def register(mcp: Any) -> None:
     @mcp.tool()
@@ -890,72 +1007,154 @@ def register(mcp: Any) -> None:
         Raises:
             FileNotFoundError: ``apk_path`` does not exist.
             ValueError: ``apk_path`` exists but is not a file.
+        Notes:
+            The body of this handler lives in
+            :func:`_build_capability_profile` so ``compute_risk_score``
+            can reuse the same APK → profile derivation without
+            round-tripping through the FastMCP closure.
         """
-        from androguard.core.apk import APK  # local — keeps cold-start fast
+        return _build_capability_profile(apk_path)
 
+    @mcp.tool()
+    async def compute_risk_score(
+        apk_path: str,
+        capability_profile: dict[str, Any] | None = None,
+        native_libs: list[dict[str, Any]] | None = None,
+        drozer_scan: dict[str, Any] | None = None,
+        mobsf_report: dict[str, Any] | None = None,
+    ) -> RiskScore:
+        """Compute a 0-100 risk score for an APK with contributing factors.
+
+        Aggregates signals from the per-tool wrappers + verify_capabilities
+        into a single capped score that the VR personas can read at a
+        glance. Each factor has a per-unit weight and (where the count
+        can balloon) a cap. The final score is the sum of contributions
+        capped at 100; the uncapped sum lives on
+        :class:`RiskScore.raw_total` so the consumer can see when an APK
+        is way past the cap.
+
+        Weighting table (these are also the named constants
+        ``_RISK_W_*`` / ``_RISK_CAP_*`` in this module):
+
+        ====================================  ======  =====
+        Factor                                 Unit    Cap
+        ====================================  ======  =====
+        exported_components                     15      30
+        v1_only_signing                         10       —
+        world_writable_files                     8      24
+        missing_certificate_pinning              6       —
+        missing_pie_per_native_lib               5       —
+        debuggable_build                        12       —
+        cleartext_traffic_allowed                7       —
+        backup_allowed                           4       —
+        missing_nx_per_native_lib                4       —
+        weak_relro_per_native_lib (partial=1,
+          none=3)                                1/3     —
+        missing_stack_canary_per_native_lib      2       —
+        provider_injection_finding              12      36
+        ====================================  ======  =====
+
+        Final score capped at 100.
+
+        Lazy invocation: when ``capability_profile`` or ``native_libs``
+        is ``None`` the handler derives them on the fly via androguard
+        / LIEF (both pure-Python, no external binaries). The
+        ``drozer_scan`` and ``mobsf_report`` inputs are never auto-
+        derived because they need a running drozer agent + a MobSF
+        server respectively; if absent, the matching factors are
+        skipped and the tool names land in ``missing_inputs`` so the
+        consumer knows the score is partial.
+
+        Args:
+            apk_path: Absolute (or ``~``-relative) path to the APK on
+                the server filesystem.
+            capability_profile: Optional pre-computed
+                ``MobileCapabilityProfile`` (as a dict, the
+                JSON-serialised form returned by
+                ``verify_capabilities``). When ``None`` the handler
+                derives one in-process via androguard.
+            native_libs: Optional pre-computed
+                ``analyze_native_libs`` output (list of per-``.so``
+                dicts). When ``None`` the handler walks the APK with
+                LIEF in-process.
+            drozer_scan: Optional pre-computed
+                ``drozer_scan_apk`` output. Skipped factor when None.
+            mobsf_report: Optional pre-computed ``mobsf_scan``
+                output. Skipped factors when None.
+
+        Returns:
+            :class:`RiskScore` with ``score`` (0-100), ``raw_total``
+            (uncapped sum), ``top_factors`` (sorted by contribution
+            descending; only non-zero contributors), and
+            ``missing_inputs`` (tool names whose absence reduced the
+            score's coverage).
+
+        Raises:
+            FileNotFoundError: ``apk_path`` does not exist.
+            ValueError: ``apk_path`` exists but is not a file.
+        """
         apk_p = Path(apk_path).expanduser().resolve()
         if not apk_p.exists():
             raise FileNotFoundError(f"apk not found: {apk_p}")
         if not apk_p.is_file():
             raise ValueError(f"apk_path is not a file: {apk_p}")
 
-        a = APK(str(apk_p))
+        # Normalize the always-available inputs. capability_profile
+        # accepts the JSON-serialised dict or a pre-validated
+        # MobileCapabilityProfile; either way we end up holding the
+        # typed model so factor evaluators have predictable shape.
+        if capability_profile is None:
+            profile = _build_capability_profile(str(apk_p))
+        elif isinstance(capability_profile, MobileCapabilityProfile):
+            profile = capability_profile
+        else:
+            profile = MobileCapabilityProfile.model_validate(capability_profile)
 
-        declared_permissions = sorted(_safe_call(a.get_permissions) or [])
-        declared_permissions_set = set(declared_permissions)
+        if native_libs is None:
+            native_libs_list = _summarize_native_libs(str(apk_p))
+        else:
+            native_libs_list = list(native_libs)
 
-        intent_actions_by_component = _collect_intent_actions_by_component(a)
-        all_declared_actions = sorted({
-            action
-            for actions in intent_actions_by_component.values()
-            for action in actions
-        })
-        all_declared_actions_set = set(all_declared_actions)
+        missing_inputs: list[str] = []
+        if drozer_scan is None:
+            missing_inputs.append("drozer")
+        if mobsf_report is None:
+            missing_inputs.append("mobsf")
 
-        exported_components = _collect_exported_components(a)
-        signing_schemes = _detect_signing_schemes(a)
-        deep_link_components = _collect_deep_link_components(a)
+        confirmed_names = {c.name for c in profile.confirmed}
 
-        confirmed: list[ConfirmedCapability] = []
-        absent: list[AbsentCapability] = []
+        factors: list[RiskFactor] = []
+        factors.append(_factor_exported_components(profile, drozer_scan))
+        factors.append(_factor_v1_only_signing(confirmed_names))
+        factors.append(_factor_world_writable(mobsf_report))
+        factors.append(_factor_missing_pinning(mobsf_report))
+        factors.append(_factor_missing_pie(native_libs_list))
+        factors.append(_factor_debuggable(confirmed_names, profile))
+        factors.append(_factor_cleartext_traffic(confirmed_names, profile))
+        factors.append(_factor_backup_allowed(confirmed_names, profile))
+        factors.append(_factor_missing_nx(native_libs_list))
+        factors.append(_factor_weak_relro(native_libs_list))
+        factors.append(_factor_missing_stack_canary(native_libs_list))
+        factors.append(_factor_provider_injection(drozer_scan))
 
-        for cap_name, cap_info in _MOBILE_CAPABILITIES.items():
-            evidence = _evaluate_capability(
-                cap_name,
-                cap_info,
-                declared_permissions_set=declared_permissions_set,
-                all_declared_actions_set=all_declared_actions_set,
-                exported_components=exported_components,
-                deep_link_components=deep_link_components,
-                signing_schemes=signing_schemes,
-                apk=a,
-            )
-            if evidence:
-                confirmed.append(ConfirmedCapability(
-                    name=cap_name,
-                    description=cap_info["description"],
-                    evidence=evidence,
-                ))
-            else:
-                absent.append(AbsentCapability(
-                    name=cap_name,
-                    description=cap_info["description"],
-                ))
+        raw_total = sum(f.contribution for f in factors)
+        score = min(raw_total, _RISK_SCORE_CAP)
 
-        uncategorized: list[UncategorizedItem] = []
-        for perm in declared_permissions:
-            if perm not in _CATALOGUED_PERMISSIONS:
-                uncategorized.append(UncategorizedItem(kind="permission", name=perm))
-        for action in all_declared_actions:
-            if action not in _CATALOGUED_INTENT_ACTIONS:
-                uncategorized.append(UncategorizedItem(kind="intent_action", name=action))
+        # Surface every non-zero contributor sorted by contribution
+        # desc. Stable sort by ``factor`` name on ties so two equal
+        # contributions render in a deterministic order across calls.
+        top_factors = sorted(
+            (f for f in factors if f.contribution > 0),
+            key=lambda f: (-f.contribution, f.factor),
+        )
 
-        return MobileCapabilityProfile(
-            package=_safe_call(a.get_package),
+        return RiskScore(
+            score=score,
+            package=profile.package,
             apk_path=str(apk_p),
-            confirmed=confirmed,
-            absent=absent,
-            uncategorized=uncategorized,
+            raw_total=raw_total,
+            top_factors=top_factors,
+            missing_inputs=missing_inputs,
         )
 
 
@@ -1306,6 +1505,88 @@ def _safe_call(callable_: Any) -> Any:
 # Helpers — verify_capabilities
 # ---------------------------------------------------------------------
 
+def _build_capability_profile(apk_path: str) -> MobileCapabilityProfile:
+    """Build the :class:`MobileCapabilityProfile` for ``apk_path``.
+
+    Module-level helper shared between the ``verify_capabilities`` tool
+    (a thin wrapper) and ``compute_risk_score`` (which reuses the
+    profile as one of its risk inputs). Keeping the androguard read
+    behind a callable that isn't decorated by FastMCP makes it
+    reachable from arbitrary call sites without going through the
+    tool registry.
+
+    Raises:
+        FileNotFoundError: ``apk_path`` does not exist.
+        ValueError: ``apk_path`` exists but is not a file.
+    """
+    from androguard.core.apk import APK  # local — keeps cold-start fast
+
+    apk_p = Path(apk_path).expanduser().resolve()
+    if not apk_p.exists():
+        raise FileNotFoundError(f"apk not found: {apk_p}")
+    if not apk_p.is_file():
+        raise ValueError(f"apk_path is not a file: {apk_p}")
+
+    a = APK(str(apk_p))
+
+    declared_permissions = sorted(_safe_call(a.get_permissions) or [])
+    declared_permissions_set = set(declared_permissions)
+
+    intent_actions_by_component = _collect_intent_actions_by_component(a)
+    all_declared_actions = sorted({
+        action
+        for actions in intent_actions_by_component.values()
+        for action in actions
+    })
+    all_declared_actions_set = set(all_declared_actions)
+
+    exported_components = _collect_exported_components(a)
+    signing_schemes = _detect_signing_schemes(a)
+    deep_link_components = _collect_deep_link_components(a)
+
+    confirmed: list[ConfirmedCapability] = []
+    absent: list[AbsentCapability] = []
+
+    for cap_name, cap_info in _MOBILE_CAPABILITIES.items():
+        evidence = _evaluate_capability(
+            cap_name,
+            cap_info,
+            declared_permissions_set=declared_permissions_set,
+            all_declared_actions_set=all_declared_actions_set,
+            exported_components=exported_components,
+            deep_link_components=deep_link_components,
+            signing_schemes=signing_schemes,
+            apk=a,
+        )
+        if evidence:
+            confirmed.append(ConfirmedCapability(
+                name=cap_name,
+                description=cap_info["description"],
+                evidence=evidence,
+            ))
+        else:
+            absent.append(AbsentCapability(
+                name=cap_name,
+                description=cap_info["description"],
+            ))
+
+    uncategorized: list[UncategorizedItem] = []
+    for perm in declared_permissions:
+        if perm not in _CATALOGUED_PERMISSIONS:
+            uncategorized.append(UncategorizedItem(kind="permission", name=perm))
+    for action in all_declared_actions:
+        if action not in _CATALOGUED_INTENT_ACTIONS:
+            uncategorized.append(UncategorizedItem(kind="intent_action", name=action))
+
+    return MobileCapabilityProfile(
+        package=_safe_call(a.get_package),
+        apk_path=str(apk_p),
+        confirmed=confirmed,
+        absent=absent,
+        uncategorized=uncategorized,
+    )
+
+
 def _collect_intent_actions_by_component(apk: Any) -> dict[tuple[str, str], list[str]]:
     """Walk every (kind, component_name) and pull its intent-filter actions.
 
@@ -1583,3 +1864,421 @@ def _evaluate_capability(
             evidence.append(CapabilityEvidence(source="signing_scheme", detail="v1"))
 
     return evidence
+
+
+# ---------------------------------------------------------------------
+# Helpers — compute_risk_score
+# ---------------------------------------------------------------------
+
+def _summarize_native_libs(apk_path: str) -> list[dict[str, Any]]:
+    """Walk an APK's ``lib/<abi>/*.so`` entries and summarise each via LIEF.
+
+    Mirrors ``tools.lief_so.analyze_native_libs`` so the risk-score
+    handler reaches the same per-library hardening fields without
+    going through the FastMCP tool closure. Per-library extraction
+    failures surface as ``{"abi", "name", "error"}`` entries — the
+    walk does not abort on the first bad library so the score still
+    reflects the libraries that DID parse.
+    """
+    import tempfile
+    import zipfile
+
+    from android_mcp.tools.lief_so import (
+        _is_native_lib_entry,
+        _summarize_elf,
+    )
+
+    apk_p = Path(apk_path).expanduser().resolve()
+    try:
+        zf = zipfile.ZipFile(apk_p)
+    except zipfile.BadZipFile:
+        return []
+
+    results: list[dict[str, Any]] = []
+    with zf:
+        so_entries = [
+            info for info in zf.infolist() if _is_native_lib_entry(info.filename)
+        ]
+        if not so_entries:
+            return []
+        with tempfile.TemporaryDirectory(prefix="android-mcp-risk-") as tmp:
+            tmp_dir = Path(tmp)
+            for info in so_entries:
+                parts = info.filename.split("/")
+                abi = parts[1] if len(parts) >= 3 else "unknown"
+                so_name = parts[-1]
+                out_path = tmp_dir / f"{abi}__{so_name}"
+                try:
+                    with zf.open(info) as src, out_path.open("wb") as dst:
+                        dst.write(src.read())
+                except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
+                    results.append({
+                        "abi": abi,
+                        "name": so_name,
+                        "error": f"extract failed: {type(exc).__name__}: {exc}",
+                    })
+                    continue
+                results.append(_summarize_elf(abi, so_name, out_path))
+    return results
+
+
+def _factor_exported_components(
+    profile: MobileCapabilityProfile,
+    drozer_scan: dict[str, Any] | None,
+) -> RiskFactor:
+    """Risk from exported components reachable by other apps on the device.
+
+    Prefers drozer's per-kind counts (activities + services + receivers
+    + providers) because they reflect what the on-device installer
+    treats as actually exported. Falls back to the manifest-derived
+    exported list on the capability profile when drozer isn't
+    available — the count is from manifest evidence collected by
+    androguard. Per-component weight applies; the factor caps at
+    ``_RISK_CAP_EXPORTED_COMPONENT``.
+    """
+    evidence: list[str] = []
+    count = 0
+    if isinstance(drozer_scan, dict):
+        comps = drozer_scan.get("exported_components")
+        if isinstance(comps, dict):
+            for kind in ("activities", "receivers", "providers", "services"):
+                kind_count = comps.get(kind, 0)
+                if isinstance(kind_count, int) and kind_count > 0:
+                    count += kind_count
+                    evidence.append(f"drozer:{kind}={kind_count}")
+    if count == 0:
+        # Fall back to the capability profile's evidence list — each
+        # exported component contributes one row of evidence with
+        # source=exported_component on the confirmed entry.
+        for c in profile.confirmed:
+            if c.name == "exported_components":
+                for ev in c.evidence:
+                    if ev.source == "exported_component":
+                        count += 1
+                        evidence.append(f"manifest:{ev.detail}")
+                break
+    contribution = min(
+        count * _RISK_W_EXPORTED_COMPONENT, _RISK_CAP_EXPORTED_COMPONENT,
+    )
+    return RiskFactor(
+        factor="exported_components",
+        weight=_RISK_W_EXPORTED_COMPONENT,
+        contribution=contribution,
+        evidence=evidence,
+    )
+
+
+def _factor_v1_only_signing(confirmed_names: set[str]) -> RiskFactor:
+    """Risk from APKs signed only with v1 (Janus / CVE-2017-13156).
+
+    The capability profile lands the ``legacy_signing_scheme_only``
+    entry in ``confirmed`` exactly when androguard's signing-block
+    walk found v1 alone. One signal, one fixed weight.
+    """
+    janus = "legacy_signing_scheme_only" in confirmed_names
+    return RiskFactor(
+        factor="v1_only_signing",
+        weight=_RISK_W_V1_ONLY_SIGNING,
+        contribution=_RISK_W_V1_ONLY_SIGNING if janus else 0,
+        evidence=(
+            ["legacy_signing_scheme_only confirmed — v1 only (Janus on API <= 25)"]
+            if janus
+            else []
+        ),
+    )
+
+
+def _factor_world_writable(mobsf_report: dict[str, Any] | None) -> RiskFactor:
+    """Risk from world-writable / world-readable file creation.
+
+    Scans the MobSF report for any code_analysis rule whose ID
+    contains a token from :data:`_MOBSF_WORLD_WRITABLE_TOKENS`. MobSF
+    flags ``openFileOutput(..., MODE_WORLD_WRITABLE)`` and adjacent
+    patterns under multiple rule-id variants across releases; the
+    substring match keeps the factor stable.
+    """
+    findings = _walk_mobsf_findings(mobsf_report, _MOBSF_WORLD_WRITABLE_TOKENS)
+    contribution = min(
+        len(findings) * _RISK_W_WORLD_WRITABLE, _RISK_CAP_WORLD_WRITABLE,
+    )
+    return RiskFactor(
+        factor="world_writable_files",
+        weight=_RISK_W_WORLD_WRITABLE,
+        contribution=contribution,
+        evidence=findings,
+    )
+
+
+def _factor_missing_pinning(mobsf_report: dict[str, Any] | None) -> RiskFactor:
+    """Risk from a customer-facing app shipping without certificate pinning.
+
+    MobSF surfaces pinning absence as a finding (e.g.
+    ``android_certificate_pinning``). The factor fires once when ANY
+    pinning-related finding is present (not per finding) — a single
+    "no pinning" verdict is the underlying signal.
+    """
+    findings = _walk_mobsf_findings(mobsf_report, _MOBSF_MISSING_PINNING_TOKENS)
+    fires = bool(findings)
+    return RiskFactor(
+        factor="missing_certificate_pinning",
+        weight=_RISK_W_MISSING_PINNING,
+        contribution=_RISK_W_MISSING_PINNING if fires else 0,
+        evidence=findings if fires else [],
+    )
+
+
+def _factor_missing_pie(native_libs: list[dict[str, Any]]) -> RiskFactor:
+    """Risk from native libraries built without position-independent code.
+
+    LIEF's ELF-type check returns ``DYN`` for any shared object, so
+    PIE is reported as True for every well-formed ``.so``. A False
+    here means the library is a static executable mistakenly packed
+    into ``lib/<abi>/`` — extremely rare but worth catching.
+    """
+    return _per_lib_hardening_factor(
+        native_libs,
+        factor_name="missing_pie_per_native_lib",
+        weight=_RISK_W_MISSING_PIE,
+        predicate=lambda h: h.get("pie") is False,
+    )
+
+
+def _factor_missing_nx(native_libs: list[dict[str, Any]]) -> RiskFactor:
+    """Risk from native libraries with an executable stack."""
+    return _per_lib_hardening_factor(
+        native_libs,
+        factor_name="missing_nx_per_native_lib",
+        weight=_RISK_W_MISSING_NX,
+        predicate=lambda h: h.get("nx") is False,
+    )
+
+
+def _factor_weak_relro(native_libs: list[dict[str, Any]]) -> RiskFactor:
+    """Risk from native libraries with partial or absent RELRO.
+
+    ``"partial"`` contributes one point per lib; ``"none"`` contributes
+    three. ``"full"`` contributes nothing. The factor's ``weight``
+    field reports the "none" weight so the consumer sees the worst
+    per-unit cost.
+    """
+    contribution = 0
+    evidence: list[str] = []
+    for lib in native_libs:
+        hardening = lib.get("hardening") if isinstance(lib, dict) else None
+        if not isinstance(hardening, dict):
+            continue
+        relro = hardening.get("relro")
+        abi = lib.get("abi", "unknown")
+        name = lib.get("name", "unknown")
+        if relro == "partial":
+            contribution += _RISK_W_WEAK_RELRO_PARTIAL
+            evidence.append(f"{abi}/{name} relro=partial")
+        elif relro == "none":
+            contribution += _RISK_W_WEAK_RELRO_NONE
+            evidence.append(f"{abi}/{name} relro=none")
+    return RiskFactor(
+        factor="weak_relro_per_native_lib",
+        weight=_RISK_W_WEAK_RELRO_NONE,
+        contribution=contribution,
+        evidence=evidence,
+    )
+
+
+def _factor_missing_stack_canary(native_libs: list[dict[str, Any]]) -> RiskFactor:
+    """Risk from native libraries built without ``-fstack-protector``."""
+    return _per_lib_hardening_factor(
+        native_libs,
+        factor_name="missing_stack_canary_per_native_lib",
+        weight=_RISK_W_MISSING_CANARY,
+        predicate=lambda h: h.get("canary") is False,
+    )
+
+
+def _factor_debuggable(
+    confirmed_names: set[str],
+    profile: MobileCapabilityProfile,
+) -> RiskFactor:
+    """Risk from ``android:debuggable=true`` shipped in a production build.
+
+    JDWP attaches from any process holding the right permission;
+    debuggable production apps are remote-code-execution-by-design.
+    Single signal, fixed weight.
+    """
+    fires = "debuggable_build" in confirmed_names
+    return RiskFactor(
+        factor="debuggable_build",
+        weight=_RISK_W_DEBUGGABLE,
+        contribution=_RISK_W_DEBUGGABLE if fires else 0,
+        evidence=_capability_evidence_details(profile, "debuggable_build"),
+    )
+
+
+def _factor_cleartext_traffic(
+    confirmed_names: set[str],
+    profile: MobileCapabilityProfile,
+) -> RiskFactor:
+    """Risk from ``android:usesCleartextTraffic=true``."""
+    fires = "cleartext_traffic_allowed" in confirmed_names
+    return RiskFactor(
+        factor="cleartext_traffic_allowed",
+        weight=_RISK_W_CLEARTEXT,
+        contribution=_RISK_W_CLEARTEXT if fires else 0,
+        evidence=_capability_evidence_details(profile, "cleartext_traffic_allowed"),
+    )
+
+
+def _factor_backup_allowed(
+    confirmed_names: set[str],
+    profile: MobileCapabilityProfile,
+) -> RiskFactor:
+    """Risk from ``android:allowBackup=true`` exposing app data via adb / cloud."""
+    fires = "backup_allowed" in confirmed_names
+    return RiskFactor(
+        factor="backup_allowed",
+        weight=_RISK_W_BACKUP_ALLOWED,
+        contribution=_RISK_W_BACKUP_ALLOWED if fires else 0,
+        evidence=_capability_evidence_details(profile, "backup_allowed"),
+    )
+
+
+def _factor_provider_injection(drozer_scan: dict[str, Any] | None) -> RiskFactor:
+    """Risk from content-provider injection findings reported by drozer.
+
+    drozer's ``scanner.provider.injection`` returns a list of URIs +
+    vectors (``projection`` / ``selection``). Each finding contributes
+    the per-unit weight up to the cap.
+    """
+    evidence: list[str] = []
+    if isinstance(drozer_scan, dict):
+        finder = drozer_scan.get("finder_results")
+        if isinstance(finder, dict):
+            findings = finder.get("provider_injection")
+            if isinstance(findings, list):
+                for entry in findings:
+                    if not isinstance(entry, dict):
+                        continue
+                    uri = entry.get("uri", "?")
+                    vector = entry.get("vector", "?")
+                    evidence.append(f"{uri} ({vector})")
+    contribution = min(
+        len(evidence) * _RISK_W_PROVIDER_INJECTION,
+        _RISK_CAP_PROVIDER_INJECTION,
+    )
+    return RiskFactor(
+        factor="provider_injection_finding",
+        weight=_RISK_W_PROVIDER_INJECTION,
+        contribution=contribution,
+        evidence=evidence,
+    )
+
+
+def _per_lib_hardening_factor(
+    native_libs: list[dict[str, Any]],
+    *,
+    factor_name: str,
+    weight: int,
+    predicate: Any,
+) -> RiskFactor:
+    """Shared per-library hardening evaluator.
+
+    Walks every entry in ``native_libs``, applies ``predicate`` to
+    the ``hardening`` sub-dict, and tallies one weight per True
+    return. Libraries without a ``hardening`` block (extraction
+    failures, parse failures) are skipped silently — the operator
+    sees them under ``analyze_native_libs`` separately.
+    """
+    evidence: list[str] = []
+    for lib in native_libs:
+        hardening = lib.get("hardening") if isinstance(lib, dict) else None
+        if not isinstance(hardening, dict):
+            continue
+        if predicate(hardening):
+            abi = lib.get("abi", "unknown")
+            name = lib.get("name", "unknown")
+            evidence.append(f"{abi}/{name}")
+    return RiskFactor(
+        factor=factor_name,
+        weight=weight,
+        contribution=len(evidence) * weight,
+        evidence=evidence,
+    )
+
+
+def _capability_evidence_details(
+    profile: MobileCapabilityProfile, capability_name: str,
+) -> list[str]:
+    """Return the ``detail`` strings of every evidence row on a confirmed capability.
+
+    Returns an empty list when the capability is absent — the caller
+    has already decided whether to fire the factor, so the empty list
+    just means "no evidence to surface for this factor's evidence
+    column".
+    """
+    for c in profile.confirmed:
+        if c.name == capability_name:
+            return [ev.detail for ev in c.evidence]
+    return []
+
+
+def _walk_mobsf_findings(
+    mobsf_report: dict[str, Any] | None,
+    tokens: tuple[str, ...],
+) -> list[str]:
+    """Pull rule IDs containing any of ``tokens`` from a MobSF report.
+
+    Two shapes are tolerated:
+      * the native MobSF shape — ``code_analysis: {rule_id: {...}}``
+      * a flat list — ``findings: [{rule_id: ..., file: ..., ...}, ...]``
+
+    Returns the matching rule IDs (deduped, sorted) plus, where the
+    rule's files dict is present, one or two example ``file:line``
+    rows for the evidence column. Multiple shapes coexist across
+    MobSF versions so the walker accepts both rather than picking a
+    rigid contract.
+    """
+    if not isinstance(mobsf_report, dict):
+        return []
+    matches: list[str] = []
+    seen: set[str] = set()
+
+    code_analysis = mobsf_report.get("code_analysis")
+    if isinstance(code_analysis, dict):
+        for rule_id, payload in code_analysis.items():
+            rule_id_l = str(rule_id).lower()
+            if not any(tok in rule_id_l for tok in tokens):
+                continue
+            if rule_id in seen:
+                continue
+            seen.add(rule_id)
+            entry = rule_id
+            if isinstance(payload, dict):
+                files = payload.get("files")
+                if isinstance(files, dict) and files:
+                    sample = next(iter(files.items()))
+                    entry = f"{rule_id} ({sample[0]})"
+            matches.append(entry)
+
+    findings = mobsf_report.get("findings")
+    if isinstance(findings, list):
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            rule_id = f.get("rule_id") or f.get("rule") or f.get("type")
+            if rule_id is None:
+                continue
+            rule_id_l = str(rule_id).lower()
+            if not any(tok in rule_id_l for tok in tokens):
+                continue
+            if rule_id in seen:
+                continue
+            seen.add(rule_id)
+            location = f.get("file") or f.get("path")
+            line = f.get("line")
+            if location and line is not None:
+                matches.append(f"{rule_id} ({location}:{line})")
+            elif location:
+                matches.append(f"{rule_id} ({location})")
+            else:
+                matches.append(str(rule_id))
+
+    return sorted(matches)
