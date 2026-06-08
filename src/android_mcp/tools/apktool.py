@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,6 @@ _log = logging.getLogger(__name__)
 
 # Apktool's default workspace lives at ~/.android-mcp/work/. Operator
 # overrides via ANDROID_MCP_WORKDIR env var on the server.
-import os
 _DEFAULT_WORKDIR = Path(os.environ.get("ANDROID_MCP_WORKDIR", "~/.android-mcp/work")).expanduser()
 
 
