@@ -19,6 +19,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -58,7 +59,20 @@ def register(mcp: Any) -> None:
         out_dir = _DEFAULT_WORKDIR / f"jadx-{sha[:16]}"
         out_dir.parent.mkdir(parents=True, exist_ok=True)
 
-        cmd = ["jadx", "-d", str(out_dir), str(target)]
+        # Resolve `jadx` via shutil.which so PATHEXT walks (Windows scoop /
+        # chocolatey ship it as jadx.CMD — Python's subprocess does NOT
+        # auto-append PATHEXT when shell=False, see apktool.py for the same
+        # gotcha).
+        jadx_bin = shutil.which("jadx")
+        if jadx_bin is None:
+            raise FileNotFoundError(
+                "jadx not found on PATH. Install via "
+                "`scoop bucket add extras && scoop install jadx` (Windows), "
+                "`brew install jadx` (macOS), or download from "
+                "https://github.com/skylot/jadx/releases and put `jadx` on "
+                "PATH.",
+            )
+        cmd = [jadx_bin, "-d", str(out_dir), str(target)]
         if deobfuscate:
             cmd.append("--deobf")
         if show_bad_code:

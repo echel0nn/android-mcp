@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -63,7 +64,21 @@ def register(mcp: Any) -> None:
         out_dir = _DEFAULT_WORKDIR / f"apktool-{sha[:16]}"
         out_dir.parent.mkdir(parents=True, exist_ok=True)
 
-        cmd = ["apktool", "d", str(apk), "-o", str(out_dir)]
+        # Resolve `apktool` via shutil.which so we walk PATHEXT on Windows
+        # (where scoop / chocolatey install the launcher as `apktool.CMD`).
+        # Python's subprocess on Windows does NOT auto-append PATHEXT when
+        # shell=False, so a bare ["apktool", ...] raises FileNotFoundError
+        # even when the .CMD shim is on PATH and `where.exe apktool` finds it.
+        apktool_bin = shutil.which("apktool")
+        if apktool_bin is None:
+            raise FileNotFoundError(
+                "apktool not found on PATH. Install via "
+                "`scoop install apktool` (Windows), `brew install apktool` "
+                "(macOS), or your distro package manager; alternatively "
+                "download the JAR from https://apktool.org/ and put a "
+                "launcher script on PATH.",
+            )
+        cmd = [apktool_bin, "d", str(apk), "-o", str(out_dir)]
         if force:
             cmd.append("--force")
         if no_resources:
