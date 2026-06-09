@@ -35,7 +35,7 @@ def register(mcp: Any) -> None:
     async def mobsf_scan(
         apk_path: str,
         rescan: bool = False,
-        timeout_seconds: int = 600,
+        timeout_seconds: int = 1800,
     ) -> dict[str, Any]:
         """Upload an APK to MobSF, trigger a static scan, return the JSON report.
 
