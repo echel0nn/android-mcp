@@ -58,7 +58,19 @@ def register(mcp: Any) -> None:
             ("provider", a.get_providers()),
         ):
             for name in names:
-                is_exported = a.get_element(kind, "exported", name=name) == "true"
+                # androguard 4.x renamed get_element → get_attribute_value
+                # (same signature). Fall back to None for older versions,
+                # which makes is_exported False — the intent-filter
+                # presence heuristic below still catches effectively-exported
+                # components on legacy SDKs, so the audit value is preserved.
+                getter = getattr(a, "get_attribute_value", None) or getattr(
+                    a, "get_element", None,
+                )
+                is_exported = (
+                    getter(kind, "exported", name=name) == "true"
+                    if getter is not None
+                    else False
+                )
                 filters = a.get_intent_filters(kind, name)
                 if is_exported or filters:
                     exported.append({
