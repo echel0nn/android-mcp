@@ -124,7 +124,69 @@ _TRAILER_LINE_RE = re.compile(
 _DETAIL_INDENT_THRESHOLD = 15
 
 
+def is_configured() -> bool:
+    """Return True iff AndroBugs is callable on this box right now.
+
+    Probes the same locations ``_resolve_invocation`` would use. When
+    this returns False, ``register()`` is a no-op — the tool stays
+    out of the agent-visible catalog so agents don't loop on
+    'not configured' errors. When the operator later sets
+    ANDROBUGS_HOME and restarts the server, the tool registers
+    normally.
+
+    Auto-discovery paths (when ANDROBUGS_HOME is unset):
+      - ``%LOCALAPPDATA%/AndroBugs_Framework/`` (Windows)
+      - ``~/AndroBugs_Framework/`` (macOS / Linux Android Studio-adjacent)
+      - ``/opt/AndroBugs_Framework/`` (Linux distro install)
+      - ``/opt/androbugs/`` (alternate Linux convention)
+    Each path must contain at least one of androbugs.exe /
+    androbugs.py / AndroBugs.py to count as configured.
+    """
+    explicit = os.environ.get(_ANDROBUGS_HOME_ENV)
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    home = Path.home()
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        candidates.append(Path(local_appdata) / "AndroBugs_Framework")
+    candidates.extend([
+        home / "AndroBugs_Framework",
+        home / "androbugs",
+        Path("/opt/AndroBugs_Framework"),
+        Path("/opt/androbugs"),
+        Path("/usr/local/share/AndroBugs_Framework"),
+    ])
+    for candidate in candidates:
+        try:
+            if not candidate.is_dir():
+                continue
+        except OSError:
+            continue
+        for entry in ("androbugs.exe", "androbugs.py", "AndroBugs.py"):
+            if (candidate / entry).is_file():
+                # Cache the discovered home as ANDROBUGS_HOME so
+                # _resolve_invocation succeeds without the operator
+                # having to set it explicitly.
+                os.environ[_ANDROBUGS_HOME_ENV] = str(candidate)
+                return True
+    return False
+
+
 def register(mcp: Any) -> None:
+    if not is_configured():
+        _log.warning(
+            "AndroBugs not configured (set %s or install under "
+            "%%LOCALAPPDATA%%/AndroBugs_Framework on Windows, "
+            "~/AndroBugs_Framework on macOS/Linux, or /opt/AndroBugs_Framework). "
+            "Tool registration SKIPPED — agents will not see androbugs_scan "
+            "in their tool catalog.",
+            _ANDROBUGS_HOME_ENV,
+        )
+        return
+    _log.info("AndroBugs configured at %s — registering androbugs_scan",
+              os.environ.get(_ANDROBUGS_HOME_ENV))
+
     @mcp.tool()
     async def androbugs_scan(
         apk_path: str,
