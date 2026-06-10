@@ -25,10 +25,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+
+from android_mcp.sdk_discovery import find_android_sdk_tool
 
 _log = logging.getLogger(__name__)
 
@@ -108,12 +109,19 @@ def register(mcp: Any) -> None:
             RuntimeError: `apksigner` is not on PATH, or the subprocess
                 timed out.
         """
-        apksigner = shutil.which("apksigner")
+        apksigner = find_android_sdk_tool("apksigner")
         if apksigner is None:
             raise RuntimeError(
-                "apksigner not on PATH. Install from the Android SDK "
-                "build-tools (sdkmanager 'build-tools;34.0.0') and add "
-                "<sdk>/build-tools/<ver>/ to PATH.",
+                "apksigner not found. Resolution searched: "
+                "(1) PATH, (2) $ANDROID_SDK_ROOT/build-tools/<ver>/, "
+                "(3) $ANDROID_HOME/build-tools/<ver>/, "
+                "(4) per-OS Android Studio defaults "
+                "(%LOCALAPPDATA%\\Android\\Sdk on Windows, "
+                "~/Library/Android/sdk on macOS, ~/Android/Sdk on "
+                "Linux), (5) package-manager defaults "
+                "(/opt/android-sdk, /usr/local/share/android-sdk). "
+                "Install via Android Studio or sdkmanager "
+                "'build-tools;34.0.0', or set ANDROID_SDK_ROOT.",
             )
 
         apk = Path(apk_path).expanduser().resolve()
