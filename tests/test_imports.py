@@ -25,7 +25,6 @@ def test_all_tool_modules_register() -> None:
     from android_mcp import composite
     from android_mcp.tools import (
         adb,
-        androbugs,
         androguard,
         apksigner,
         apktool,
@@ -35,13 +34,11 @@ def test_all_tool_modules_register() -> None:
         lief_so,
         mobsf_static,
         objection,
-        qark,
         yara_decompiled,
     )
 
     modules = (
         adb,
-        androbugs,
         androguard,
         apksigner,
         apktool,
@@ -51,7 +48,6 @@ def test_all_tool_modules_register() -> None:
         lief_so,
         mobsf_static,
         objection,
-        qark,
         yara_decompiled,
         composite,
     )

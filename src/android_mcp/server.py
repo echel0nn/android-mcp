@@ -40,7 +40,6 @@ def _register_all() -> None:
     from . import composite
     from .tools import (
         adb,
-        androbugs,
         androguard,
         apksigner,
         apktool,
@@ -50,13 +49,11 @@ def _register_all() -> None:
         lief_so,
         mobsf_static,
         objection,
-        qark,
         yara_decompiled,
     )
 
     modules = (
         adb,
-        androbugs,
         androguard,
         apksigner,
         apktool,
@@ -66,7 +63,6 @@ def _register_all() -> None:
         lief_so,
         mobsf_static,
         objection,
-        qark,
         yara_decompiled,
         composite,
     )

@@ -45,6 +45,28 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    # androguard logs via loguru, which BYPASSES stdlib logging entirely.
+    # Without an explicit loguru sink override, loguru ships with its
+    # default sink at DEBUG and floods stderr with per-basic-block parse
+    # lines. On a 36k-class APK like VF Yanımda that exceeded 12 GB of
+    # err.log inside a single classify_behavior run; the disk pressure
+    # eventually killed the HTTP listener. Silence loguru at the same
+    # level the operator picked on the CLI (default WARNING is hardcoded
+    # for safety even if the CLI says DEBUG — DEBUG on androguard is
+    # never operator-actionable).
+    try:
+        from loguru import logger as _loguru_logger  # noqa: PLC0415
+        _loguru_logger.remove()
+        _loguru_logger.add(
+            sys.stderr,
+            level="WARNING",
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {name}: {message}",
+        )
+    except ImportError:
+        # loguru is androguard's transitive dep; if missing, stdlib
+        # logging is the only path and basicConfig above handles it.
+        pass
+
     if args.mode == "stdio":
         from .server import mcp
 
