@@ -20,8 +20,8 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-
 from .async_runtime import configure_thread_pool, run_tool, runtime_stats
+from .result_cache import cache_dispatch, invalidate_all, stats as cache_stats
 from .server import mcp
 
 _log = logging.getLogger(__name__)
@@ -85,14 +85,29 @@ def build_app() -> FastAPI:
         # Resolve the underlying callable once; run_tool handles
         # sync/async detection + per-tool cap + dedup + timeout.
         fn = getattr(tool, "fn", None) or getattr(tool, "func", None) or tool
-        return await run_tool(name, fn, payload)
+        # cache_dispatch fronts run_tool with an in-process LRU + inflight-
+        # future dedup for heavyweight static-analysis actions (see
+        # result_cache.CACHEABLE_ACTIONS). Non-cacheable actions
+        # pass through transparently.
+        return await cache_dispatch(name, payload, lambda: run_tool(name, fn, payload))
 
     @app.get("/runtime")
     async def runtime_diag() -> dict[str, Any]:
         stats = runtime_stats()
         stats["tool_count"] = len(tool_index)
         stats["tools"] = sorted(tool_index.keys())
+        stats["result_cache"] = cache_stats()
         return stats
+
+    @app.post("/cache/invalidate")
+    async def cache_invalidate() -> dict[str, int]:
+        """Operator escape hatch: drop every cached result. Use when
+        the operator re-uploads an APK with the same hash but
+        different content (rare — would require sha256 collision)
+        or when the operator wants to force a fresh analysis run."""
+        evicted = invalidate_all()
+        _log.info("result_cache invalidate_all: evicted %d entries", evicted)
+        return {"evicted": evicted}
 
     return app
 
