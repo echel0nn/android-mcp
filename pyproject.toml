@@ -25,6 +25,16 @@ dependencies = [
     "lief>=0.16.0",                # ELF/Mach-O inside APKs (native .so files)
     "cryptography>=42.0.0",       # certificate / signing analysis
     "requests>=2.31.0",            # MobSF REST API client
+    # React Native bundle extraction: hermes-dec decodes Hermes bytecode
+    # (.hbc) bundles to readable JS, jsbeautifier unminifies plain JS
+    # bundles so downstream tree-sitter slicing can find declaration
+    # boundaries. tree_sitter + tree_sitter_javascript drive the slicer
+    # itself. All four are pure-Python so they install cleanly inside
+    # the FastMCP runtime.
+    "hermes-dec>=1.0.0",           # Hermes (.hbc) decompiler — pure Python
+    "jsbeautifier>=1.15.0",        # plain-JS unminifier
+    "tree-sitter>=0.21.0",         # syntactic slicer engine
+    "tree-sitter-javascript>=0.21.0",   # JS grammar for the slicer
 ]
 
 [project.optional-dependencies]

@@ -36,6 +36,7 @@ def register(mcp: Any) -> None:
         deobfuscate: bool = True,
         show_bad_code: bool = True,
         threads: int = 0,
+        force: bool = False,
     ) -> dict[str, Any]:
         """Decompile an APK / dex / jar with jadx.
 
@@ -46,6 +47,14 @@ def register(mcp: Any) -> None:
                 decompiler errors leave fragments — usually wanted for
                 audit work).
             threads: Decompiler thread count (0 = jadx default).
+            force: Wipe the cached output dir before invoking jadx.
+                Mirrors apktool_decode's `force` semantic — needed
+                when a prior partial run left the destination in a
+                bad state; jadx's CLI guards against overwriting an
+                existing output dir, so AILA's analysis-retry path
+                trips that guard and perma-fails without this flag.
+                The work dir is content-addressed by APK sha so the
+                wipe-and-rerun is idempotent.
 
         Returns:
             dict with `output_dir`, `sha256`, `sources_dir`,
@@ -58,6 +67,12 @@ def register(mcp: Any) -> None:
         sha = _sha256_file(target)
         out_dir = _DEFAULT_WORKDIR / f"jadx-{sha[:16]}"
         out_dir.parent.mkdir(parents=True, exist_ok=True)
+        if force and out_dir.exists():
+            # Idempotent wipe — out_dir is content-addressed by APK sha,
+            # so deleting it just discards the prior decompile and lets
+            # the retry produce a fresh, complete tree.
+            import shutil as _shutil  # noqa: PLC0415
+            _shutil.rmtree(out_dir)
 
         # Resolve `jadx` via shutil.which so PATHEXT walks (Windows scoop /
         # chocolatey ship it as jadx.CMD — Python's subprocess does NOT

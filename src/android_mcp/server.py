@@ -49,6 +49,7 @@ def _register_all() -> None:
         lief_so,
         mobsf_static,
         objection,
+        react_native,
         yara_decompiled,
     )
 
@@ -63,6 +64,7 @@ def _register_all() -> None:
         lief_so,
         mobsf_static,
         objection,
+        react_native,
         yara_decompiled,
         composite,
     )

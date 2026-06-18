@@ -11,3 +11,9 @@ dist/
 .run/
 .env
 .env.local
+
+# JVM crash dumps from the bundled jadx run when it OOMs or
+# segfaults — operator-local diagnostic only, never the repo's
+# concern. Pattern matches the standard HotSpot hs_err_pid<N>.log
+# layout in cwd.
+hs_err_pid*.log
